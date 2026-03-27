@@ -54,5 +54,9 @@ ftp lifecycle TTL 7 дней
 docker compose
 postgres
 без kafka
-без UI
+без UI на Stage 1-3
 без сложной multi-tenant логики
+
+решение по roadmap:
+
+Stage 4 с UI

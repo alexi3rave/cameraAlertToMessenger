@@ -62,12 +62,13 @@ env/app.env
 
 1. статус deliveries:
 
-в документах встречается uploaded
-в БД используется pending
+в документах ранее встречался uploaded
+целевой контракт: pending / started / sent / failed
 
 решение:
 
 используем pending как единственный начальный статус
+uploaded не используем как основной
 
 2. lifecycle events описан по-разному в разных документах
 
@@ -205,6 +206,4 @@ Stage reports
 
 решение:
 
-Stage 4 без UI
-или
-отдельный roadmap UI
+Stage 4 с UI

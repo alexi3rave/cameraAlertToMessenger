@@ -1,0 +1,86 @@
+# Только ../env/app.env — docker compose должен читать файл от вашего пользователя.
+# Секреты (POSTGRES_PASSWORD и т.д.) храните в app.env (chmod 600) или скопируйте из .env вручную.
+# Файл .env в compose не подключаем — иначе при root-only правах будет permission denied.
+
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: camera-v2-postgres
+    restart: unless-stopped
+    env_file:
+      - ../env/app.env
+    volumes:
+      - ../state/postgres:/var/lib/postgresql/data
+      - ../migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U camera -d camera_v2"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  watcher:
+    build:
+      context: ../app
+      dockerfile: Dockerfile
+    container_name: camera-v2-watcher
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ../env/app.env
+    volumes:
+      - /home/poe3/ftp:/source:ro
+      - ../logs/watcher:/logs
+      - ../state/watcher:/state
+    depends_on:
+      - postgres
+    command: ["python", "-u", "watcher.py"]
+
+  processor:
+    build:
+      context: ../app
+      dockerfile: Dockerfile
+    container_name: camera-v2-processor
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ../env/app.env
+    volumes:
+      - /home/poe3/ftp:/source:ro
+      - ../logs/processor:/logs
+    depends_on:
+      - postgres
+    command: ["python", "-u", "processor.py"]
+
+  retry:
+    build:
+      context: ../app
+      dockerfile: Dockerfile
+    container_name: camera-v2-retry
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ../env/app.env
+    volumes:
+      - ../logs/retry:/logs
+    depends_on:
+      - postgres
+    command: ["python", "-u", "retry_worker.py"]
+
+  ftp_cleanup:
+    build:
+      context: ../app
+      dockerfile: Dockerfile
+    container_name: camera-v2-ftp-cleanup
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ../env/app.env
+    volumes:
+      - /home/poe3/ftp:/source
+      - ../logs/ftp_cleanup:/logs
+    depends_on:
+      - postgres
+    command: ["python", "-u", "ftp_cleanup_worker.py"]

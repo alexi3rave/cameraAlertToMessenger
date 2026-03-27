@@ -50,7 +50,7 @@ processor
 
 retry_worker
 
-обрабатывает deliveries со статусом failed_retryable
+обрабатывает events со статусом failed_retryable
 повторяет отправку
 использует backoff
 

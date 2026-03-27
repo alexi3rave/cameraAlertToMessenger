@@ -20,10 +20,9 @@ quarantine
 DELIVERY STATUS CONTRACT (зафиксировано)
 
 pending
-processing
+started
 sent
-failed_retryable
-failed_terminal
+failed
 
 pending используется как единый начальный статус
 uploaded НЕ используется
