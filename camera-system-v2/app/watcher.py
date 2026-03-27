@@ -8,6 +8,15 @@ WATCH_PATH = "/source"
 ALLOWED_EXTENSIONS = {".jpg",".jpeg",".png"}
 
 MAX_FILE_AGE_SECONDS = 172800
+FILE_STABILIZE_SECONDS = float(os.environ.get("WATCH_FILE_STABILIZE_SECONDS", "1"))
+WATCH_LOOP_SLEEP_SECONDS = float(os.environ.get("WATCH_LOOP_SLEEP_SECONDS", "5"))
+WATCH_INITIAL_LOOKBACK_SECONDS = float(
+    os.environ.get("WATCH_INITIAL_LOOKBACK_SECONDS", "120")
+)
+WATCH_MTIME_GUARD_SECONDS = float(os.environ.get("WATCH_MTIME_GUARD_SECONDS", "2"))
+WATCH_USE_MTIME_CURSOR = (
+    os.environ.get("WATCH_USE_MTIME_CURSOR", "0").strip().lower() in ("1", "true", "yes")
+)
 PIPELINE_SCHEMA_MODE = os.environ.get("PIPELINE_SCHEMA_MODE", "legacy").strip().lower()
 
 
@@ -20,6 +29,8 @@ DB_PORT=os.environ.get("POSTGRES_PORT","5432")
 
 
 print(f"watcher started mode={PIPELINE_SCHEMA_MODE}",flush=True)
+
+scan_from_ts = max(0.0, time.time() - WATCH_INITIAL_LOOKBACK_SECONDS)
 
 
 def get_conn():
@@ -83,6 +94,8 @@ while True:
 
     try:
 
+        loop_started_at = time.time()
+
         for root,_,files in os.walk(WATCH_PATH):
 
             for f in files:
@@ -100,13 +113,19 @@ while True:
 
                 mtime1=os.path.getmtime(path)
 
+                if WATCH_USE_MTIME_CURSOR and mtime1 < scan_from_ts:
+
+                    continue
+
 
                 if (time.time()-mtime1)>MAX_FILE_AGE_SECONDS:
 
                     continue
 
 
-                time.sleep(1)
+                if FILE_STABILIZE_SECONDS > 0:
+
+                    time.sleep(FILE_STABILIZE_SECONDS)
 
 
                 size2=os.path.getsize(path)
@@ -434,13 +453,21 @@ checksum
 
                     conn.close()
 
+        if WATCH_USE_MTIME_CURSOR:
 
-        time.sleep(5)
+            scan_from_ts = max(0.0, loop_started_at - WATCH_MTIME_GUARD_SECONDS)
+
+
+        if WATCH_LOOP_SLEEP_SECONDS > 0:
+
+            time.sleep(WATCH_LOOP_SLEEP_SECONDS)
 
 
     except Exception as e:
 
         print("watcher error:",e,flush=True)
 
-        time.sleep(5)
+        if WATCH_LOOP_SLEEP_SECONDS > 0:
+
+            time.sleep(WATCH_LOOP_SLEEP_SECONDS)
 
