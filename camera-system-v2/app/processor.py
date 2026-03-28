@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -19,6 +20,7 @@ SHADOW_TEST_CHAT_ID = os.getenv("SHADOW_TEST_CHAT_ID", "").strip()
 PIPELINE_SCHEMA_MODE = os.getenv("PIPELINE_SCHEMA_MODE", "legacy").strip().lower()
 PROCESSOR_IDLE_SLEEP_SECONDS = float(os.getenv("PROCESSOR_IDLE_SLEEP_SECONDS", "2"))
 PROCESSOR_ERROR_SLEEP_SECONDS = float(os.getenv("PROCESSOR_ERROR_SLEEP_SECONDS", "5"))
+EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
 
 
 def db():
@@ -47,11 +49,11 @@ def _as_utc(dt):
     return dt.astimezone(timezone.utc)
 
 
-def _fmt_utc(dt):
+def _fmt_moscow(dt):
     dt = _as_utc(dt)
     if dt is None:
         return "unknown"
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return dt.astimezone(EVENT_DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
 
 
 def build_text(camera_code, first_seen_at, ftp_write_time_utc):
@@ -62,14 +64,14 @@ def build_text(camera_code, first_seen_at, ftp_write_time_utc):
     if first_seen_utc and ftp_write_utc:
         delta_sec = abs((first_seen_utc - ftp_write_utc).total_seconds())
         if delta_sec <= 1:
-            lines.append(f"🕒 Время события: {_fmt_utc(first_seen_utc)}")
+            lines.append(f"🕒 Время события: {_fmt_moscow(first_seen_utc)}")
         else:
-            lines.append(f"🕒 Обнаружено системой: {_fmt_utc(first_seen_utc)}")
-            lines.append(f"🗂 Время записи на FTP: {_fmt_utc(ftp_write_utc)}")
+            lines.append(f"🕒 Обнаружено системой: {_fmt_moscow(first_seen_utc)}")
+            lines.append(f"🗂 Время записи на FTP: {_fmt_moscow(ftp_write_utc)}")
     elif first_seen_utc:
-        lines.append(f"🕒 Обнаружено системой: {_fmt_utc(first_seen_utc)}")
+        lines.append(f"🕒 Обнаружено системой: {_fmt_moscow(first_seen_utc)}")
     else:
-        lines.append(f"🗂 Время записи на FTP: {_fmt_utc(ftp_write_utc)}")
+        lines.append(f"🗂 Время записи на FTP: {_fmt_moscow(ftp_write_utc)}")
 
     return "\n".join(lines)
 

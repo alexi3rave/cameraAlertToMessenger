@@ -44,7 +44,7 @@ processor
 
 определяет recipients
 создает deliveries
-вызывает MAX API
+вызывает MAX API (текст + изображение)
 
 ---
 

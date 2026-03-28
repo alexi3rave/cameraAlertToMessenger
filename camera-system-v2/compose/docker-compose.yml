@@ -31,7 +31,7 @@ services:
     env_file:
       - ../env/app.env
     volumes:
-      - /home/poe3/ftp:/source:ro
+      - ${FTP_SOURCE_PATH:-/home/alex/camera-system/ftp-uploads}:/source:ro
       - ../logs/watcher:/logs
       - ../state/watcher:/state
     depends_on:
@@ -48,7 +48,7 @@ services:
     env_file:
       - ../env/app.env
     volumes:
-      - /home/poe3/ftp:/source:ro
+      - ${FTP_SOURCE_PATH:-/home/alex/camera-system/ftp-uploads}:/source:ro
       - ../logs/processor:/logs
     depends_on:
       - postgres
@@ -79,7 +79,7 @@ services:
     env_file:
       - ../env/app.env
     volumes:
-      - /home/poe3/ftp:/source
+      - ${FTP_SOURCE_PATH:-/home/alex/camera-system/ftp-uploads}:/source
       - ../logs/ftp_cleanup:/logs
     depends_on:
       - postgres

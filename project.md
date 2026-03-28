@@ -34,6 +34,9 @@ v2 НЕ заменяет n8n на текущем этапе.
    deliveries = pending/started/sent/failed
 ✅ MAX upload переведен на актуальный flow (/uploads?type=image)
 ✅ добавлено время события в текст сообщения (без имени файла)
+✅ v2 переведен на единый источник FTP через `FTP_SOURCE_PATH` (текущий runtime: `/home/alex/camera-system/ftp-uploads`)
+✅ n8n и `camera-ftp` работают в общей docker-сети `camera-infra`, host для n8n: `camera-ftp`
+✅ время в уведомлениях v2 отображается в часовом поясе `Europe/Moscow` (MSK)
 
 цель Stage 3:
 
@@ -84,6 +87,10 @@ postgres
 
 4) Stage 4
    - запуск UI для маршрутизации, статусов и ручных действий по quarantine
+
+5) конфигурационная дисциплина n8n
+   - экспортировать актуальные workflow/credentials-mapping (без секретов) в репозиторий
+   - вести versioning изменений n8n рядом с инфраструктурной документацией
 
 решение по roadmap:
 
