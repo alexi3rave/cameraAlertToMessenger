@@ -1,12 +1,14 @@
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import event_journal
 
-from max_client import is_configured, send_message_with_photo
+from max_client import is_configured, send_message, send_message_with_photo
 from retry_policy import delay_before_next_retry, fetch_retry_policy
 
 DB_NAME = os.getenv("POSTGRES_DB", os.getenv("DB_NAME", "camera_v2"))
@@ -20,7 +22,12 @@ SHADOW_TEST_CHAT_ID = os.getenv("SHADOW_TEST_CHAT_ID", "").strip()
 PIPELINE_SCHEMA_MODE = os.getenv("PIPELINE_SCHEMA_MODE", "legacy").strip().lower()
 PROCESSOR_IDLE_SLEEP_SECONDS = float(os.getenv("PROCESSOR_IDLE_SLEEP_SECONDS", "2"))
 PROCESSOR_ERROR_SLEEP_SECONDS = float(os.getenv("PROCESSOR_ERROR_SLEEP_SECONDS", "5"))
+_journal = event_journal.get_journal()
 EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
+TEST_FILE_REGEX = re.compile(
+    os.getenv("TEST_FILE_REGEX", r"(^test_|_test_|healthcheck|probe)"),
+    re.IGNORECASE,
+)
 
 
 def db():
@@ -73,6 +80,19 @@ def build_text(camera_code, first_seen_at, ftp_write_time_utc):
     else:
         lines.append(f"🗂 Время записи на FTP: {_fmt_moscow(ftp_write_utc)}")
 
+    return "\n".join(lines)
+
+
+def is_test_file(file_name):
+    return bool(file_name and TEST_FILE_REGEX.search(file_name))
+
+
+def build_test_text(camera_code, first_seen_at):
+    lines = [
+        "✅ Test event received",
+        f"📷 Камера: {camera_code}",
+        f"🕒 Время получения: {_fmt_moscow(first_seen_at)}",
+    ]
     return "\n".join(lines)
 
 
@@ -510,6 +530,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"QUARANTINE: {event_id} route_not_found", flush=True)
+                _journal.info(
+                    f"processor\tQUARANTINE"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\treason=route_not_found"
+                )
                 continue
 
             if SHADOW_MODE == "prod" and not row.get("max_chat_id"):
@@ -524,6 +549,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"QUARANTINE: {event_id} recipient_missing_chat_id", flush=True)
+                _journal.info(
+                    f"processor\tQUARANTINE"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\treason=recipient_missing_chat_id"
+                )
                 continue
 
             policy = fetch_retry_policy(conn)
@@ -543,10 +573,15 @@ def main():
             mark_delivery_started(conn, event_id, attempt_no)
 
             ftp_write_time_utc = get_ftp_write_time_utc(row["full_path"])
-            text = build_text(
-                row["camera_code"],
-                row["first_seen_at"],
-                ftp_write_time_utc,
+            test_event = is_test_file(row.get("file_name"))
+            text = (
+                build_test_text(row["camera_code"], row["first_seen_at"])
+                if test_event
+                else build_text(
+                    row["camera_code"],
+                    row["first_seen_at"],
+                    ftp_write_time_utc,
+                )
             )
 
             if SHADOW_MODE == "dry_run":
@@ -555,6 +590,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"SENT dry_run: {event_id}", flush=True)
+                _journal.info(
+                    f"processor\tSENT"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\tmode=dry_run"
+                )
                 continue
 
             if SHADOW_MODE == "shadow":
@@ -579,6 +619,11 @@ def main():
                         f"FAILED: {event_id} shadow_chat_not_configured ({out})",
                         flush=True,
                     )
+                    _journal.error(
+                        f"processor\tFAILED"
+                        f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                        f"\treason=shadow_chat_not_configured\toutcome={out}"
+                    )
                     continue
 
                 if not is_configured():
@@ -602,14 +647,27 @@ def main():
                         f"FAILED: {event_id} max_api_not_configured ({out})",
                         flush=True,
                     )
+                    _journal.error(
+                        f"processor\tFAILED"
+                        f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                        f"\treason=max_api_not_configured\tmode=shadow\toutcome={out}"
+                    )
                     continue
 
-                send_message_with_photo(SHADOW_TEST_CHAT_ID, text, row["full_path"])
+                if test_event:
+                    send_message(SHADOW_TEST_CHAT_ID, text)
+                else:
+                    send_message_with_photo(SHADOW_TEST_CHAT_ID, text, row["full_path"])
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
                 mark_sent(conn, event_id)
                 conn.commit()
                 conn.close()
                 print(f"SENT shadow: {event_id}", flush=True)
+                _journal.info(
+                    f"processor\tSENT"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\tmode=shadow"
+                )
                 continue
 
             if SHADOW_MODE == "prod":
@@ -634,15 +692,28 @@ def main():
                         f"FAILED: {event_id} max_api_not_configured ({out})",
                         flush=True,
                     )
+                    _journal.error(
+                        f"processor\tFAILED"
+                        f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                        f"\treason=max_api_not_configured\tmode=prod\toutcome={out}"
+                    )
                     continue
 
                 chat_id = row["max_chat_id"]
-                send_message_with_photo(chat_id, text, row["full_path"])
+                if test_event:
+                    send_message(chat_id, text)
+                else:
+                    send_message_with_photo(chat_id, text, row["full_path"])
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
                 mark_sent(conn, event_id)
                 conn.commit()
                 conn.close()
                 print(f"SENT prod: {event_id}", flush=True)
+                _journal.info(
+                    f"processor\tSENT"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\tmode=prod"
+                )
                 continue
 
             finish_delivery(conn, event_id, attempt_no, "failed", "unsupported_mode")
@@ -656,6 +727,11 @@ def main():
             conn.commit()
             conn.close()
             print(f"FAILED: {event_id} unsupported_mode ({out})", flush=True)
+            _journal.info(
+                f"processor\tFAILED"
+                f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                f"\treason=unsupported_mode\toutcome={out}"
+            )
 
         except Exception as e:
             err = str(e)[:500]
@@ -687,6 +763,12 @@ def main():
                     c2.commit()
                     c2.close()
                     print(f"ERROR event={event_id}: {e}", flush=True)
+                    _journal.error(
+                        f"processor\tERROR"
+                        f"\tcamera={row.get('camera_code') if row else '?'}"
+                        f"\tfile={row.get('file_name') if row else '?'}"
+                        f"\terror={err}"
+                    )
                 elif event_id:
                     c2 = db()
                     c2.autocommit = False
@@ -695,8 +777,15 @@ def main():
                     c2.commit()
                     c2.close()
                     print(f"ERROR event={event_id} (no recipient row): {e}", flush=True)
+                    _journal.error(
+                        f"processor\tERROR"
+                        f"\tcamera={row.get('camera_code') if row else '?'}"
+                        f"\tfile={row.get('file_name') if row else '?'}"
+                        f"\terror={err}"
+                    )
                 else:
                     print(f"ERROR before event picked: {e}", flush=True)
+                    _journal.error(f"processor\tERROR\tcamera=?\tfile=?\terror={err}")
             except Exception as e2:
                 print(f"ERROR nested: {e2}", flush=True)
             finally:

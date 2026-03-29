@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import os
 import time
 import psycopg2
+import event_journal
 
 DB_NAME = os.getenv("POSTGRES_DB", os.getenv("DB_NAME", "camera_v2"))
 DB_USER = os.getenv("POSTGRES_USER", os.getenv("DB_USER", "camera"))
@@ -19,9 +22,31 @@ FTP_ROOT = os.getenv("FTP_CLEANUP_ROOT", "/source").rstrip("/") or "/source"
 RETENTION_DAYS = int(os.getenv("FTP_RETENTION_DAYS", "7"))
 INTERVAL_SEC = int(os.getenv("FTP_CLEANUP_INTERVAL_SEC", "3600"))
 BATCH = int(os.getenv("FTP_CLEANUP_BATCH", "200"))
+LOG_DIR = os.getenv("FTP_CLEANUP_LOG_DIR", "/logs")
+LOG_FILE = os.path.join(LOG_DIR, "ftp_cleanup.log")
+LOG_MAX_BYTES = int(os.getenv("FTP_CLEANUP_LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+LOG_BACKUP_COUNT = int(os.getenv("FTP_CLEANUP_LOG_BACKUP_COUNT", "5"))
 
 # Статусы, после которых оригинальный файл для доставки больше не нужен.
 TERMINAL = ("sent", "quarantine")
+
+
+def _setup_file_logger() -> logging.Logger:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logger = logging.getLogger("ftp_cleanup")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s\t%(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(handler)
+    return logger
 
 
 def db():
@@ -64,15 +89,18 @@ def path_is_under_root(candidate: str, root_real: str) -> bool:
 
 
 def main():
+    journal = _setup_file_logger()
+    ev_journal = event_journal.get_journal()
     print(
         f"ftp_cleanup started root={FTP_ROOT} retention_days={RETENTION_DAYS} "
-        f"interval={INTERVAL_SEC}s",
+        f"interval={INTERVAL_SEC}s log={LOG_FILE}",
         flush=True,
     )
     print(
         f"ftp_cleanup db: host={DB_HOST} port={DB_PORT} dbname={DB_NAME} user={DB_USER}",
         flush=True,
     )
+    journal.info(f"START\tretention_days={RETENTION_DAYS}\troot={FTP_ROOT}")
     _probe = db()
     try:
         assert_events_has_ftp_removed_at(_probe)
@@ -89,7 +117,7 @@ def main():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, full_path, file_name
+                    SELECT id, full_path, file_name, camera_code, first_seen_at
                     FROM events
                     WHERE ftp_removed_at IS NULL
                       AND status = ANY(%s)
@@ -103,7 +131,7 @@ def main():
 
             removed = 0
             skipped = 0
-            for event_id, full_path, file_name in rows:
+            for event_id, full_path, file_name, camera_code, first_seen_at in rows:
                 if not full_path or not isinstance(full_path, str):
                     skipped += 1
                     continue
@@ -126,6 +154,16 @@ def main():
                             """,
                             (event_id,),
                         )
+                    journal.info(
+                        f"ALREADY_GONE"
+                        f"\tcamera={camera_code}\tfile={file_name}"
+                        f"\tfirst_seen={first_seen_at}"
+                    )
+                    ev_journal.info(
+                        f"ftp_cleanup\tDELETED"
+                        f"\tcamera={camera_code}\tfile={file_name}"
+                        f"\tfirst_seen={first_seen_at}\tnote=already_gone"
+                    )
                     removed += 1
                     continue
                 except OSError as e:
@@ -141,6 +179,7 @@ def main():
                     os.remove(full_path)
                 except OSError as e:
                     print(f"ftp_cleanup remove error {full_path}: {e}", flush=True)
+                    journal.warning(f"REMOVE_ERROR\tcamera={camera_code}\tfile={file_name}\terror={e}")
                     skipped += 1
                     continue
 
@@ -153,17 +192,28 @@ def main():
                         """,
                         (event_id,),
                     )
+                journal.info(
+                    f"DELETED"
+                    f"\tcamera={camera_code}\tfile={file_name}"
+                    f"\tfirst_seen={first_seen_at}\tpath={full_path}"
+                )
+                ev_journal.info(
+                    f"ftp_cleanup\tDELETED"
+                    f"\tcamera={camera_code}\tfile={file_name}"
+                    f"\tfirst_seen={first_seen_at}\tpath={full_path}"
+                )
                 removed += 1
 
             conn.commit()
             conn.close()
             if removed or skipped:
-                print(
-                    f"ftp_cleanup batch removed_or_marked={removed} skipped={skipped}",
-                    flush=True,
-                )
+                msg = f"ftp_cleanup batch removed_or_marked={removed} skipped={skipped}"
+                print(msg, flush=True)
+                journal.info(f"BATCH\tremoved={removed}\tskipped={skipped}")
         except Exception as e:
             print(f"ftp_cleanup ERROR: {e}", flush=True)
+            journal.error(f"ERROR\t{e}")
+            ev_journal.error(f"ftp_cleanup\tERROR\tcamera=?\tfile=?\terror={str(e)[:300]}")
             if conn is not None:
                 try:
                     conn.rollback()
