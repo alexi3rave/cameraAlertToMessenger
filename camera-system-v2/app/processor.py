@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -6,7 +7,7 @@ from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from max_client import is_configured, send_message_with_photo
+from max_client import is_configured, send_message, send_message_with_photo
 from retry_policy import delay_before_next_retry, fetch_retry_policy
 
 DB_NAME = os.getenv("POSTGRES_DB", os.getenv("DB_NAME", "camera_v2"))
@@ -21,6 +22,10 @@ PIPELINE_SCHEMA_MODE = os.getenv("PIPELINE_SCHEMA_MODE", "legacy").strip().lower
 PROCESSOR_IDLE_SLEEP_SECONDS = float(os.getenv("PROCESSOR_IDLE_SLEEP_SECONDS", "2"))
 PROCESSOR_ERROR_SLEEP_SECONDS = float(os.getenv("PROCESSOR_ERROR_SLEEP_SECONDS", "5"))
 EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
+TEST_FILE_REGEX = re.compile(
+    os.getenv("TEST_FILE_REGEX", r"(^test_|_test_|healthcheck|probe)"),
+    re.IGNORECASE,
+)
 
 
 def db():
@@ -73,6 +78,19 @@ def build_text(camera_code, first_seen_at, ftp_write_time_utc):
     else:
         lines.append(f"🗂 Время записи на FTP: {_fmt_moscow(ftp_write_utc)}")
 
+    return "\n".join(lines)
+
+
+def is_test_file(file_name):
+    return bool(file_name and TEST_FILE_REGEX.search(file_name))
+
+
+def build_test_text(camera_code, first_seen_at):
+    lines = [
+        "✅ Test event received",
+        f"📷 Камера: {camera_code}",
+        f"🕒 Время получения: {_fmt_moscow(first_seen_at)}",
+    ]
     return "\n".join(lines)
 
 
@@ -543,10 +561,15 @@ def main():
             mark_delivery_started(conn, event_id, attempt_no)
 
             ftp_write_time_utc = get_ftp_write_time_utc(row["full_path"])
-            text = build_text(
-                row["camera_code"],
-                row["first_seen_at"],
-                ftp_write_time_utc,
+            test_event = is_test_file(row.get("file_name"))
+            text = (
+                build_test_text(row["camera_code"], row["first_seen_at"])
+                if test_event
+                else build_text(
+                    row["camera_code"],
+                    row["first_seen_at"],
+                    ftp_write_time_utc,
+                )
             )
 
             if SHADOW_MODE == "dry_run":
@@ -604,7 +627,10 @@ def main():
                     )
                     continue
 
-                send_message_with_photo(SHADOW_TEST_CHAT_ID, text, row["full_path"])
+                if test_event:
+                    send_message(SHADOW_TEST_CHAT_ID, text)
+                else:
+                    send_message_with_photo(SHADOW_TEST_CHAT_ID, text, row["full_path"])
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
                 mark_sent(conn, event_id)
                 conn.commit()
@@ -637,7 +663,10 @@ def main():
                     continue
 
                 chat_id = row["max_chat_id"]
-                send_message_with_photo(chat_id, text, row["full_path"])
+                if test_event:
+                    send_message(chat_id, text)
+                else:
+                    send_message_with_photo(chat_id, text, row["full_path"])
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
                 mark_sent(conn, event_id)
                 conn.commit()
