@@ -1,3 +1,18 @@
-
 __pycache__/
 *.pyc
+
+# секреты и env-файлы
+*.env
+.env*
+*.bak
+env/
+
+# серверные бэкапы
+server-backups/
+
+# n8n воркфлоу (содержат токены API)
+n8n/
+
+# IDE
+.idea/
+.vscode/
