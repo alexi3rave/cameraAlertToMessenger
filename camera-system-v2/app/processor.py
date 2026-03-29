@@ -619,6 +619,11 @@ def main():
                         f"FAILED: {event_id} shadow_chat_not_configured ({out})",
                         flush=True,
                     )
+                    _journal.error(
+                        f"processor\tFAILED"
+                        f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                        f"\treason=shadow_chat_not_configured\toutcome={out}"
+                    )
                     continue
 
                 if not is_configured():
@@ -641,6 +646,11 @@ def main():
                     print(
                         f"FAILED: {event_id} max_api_not_configured ({out})",
                         flush=True,
+                    )
+                    _journal.error(
+                        f"processor\tFAILED"
+                        f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                        f"\treason=max_api_not_configured\tmode=shadow\toutcome={out}"
                     )
                     continue
 
@@ -681,6 +691,11 @@ def main():
                     print(
                         f"FAILED: {event_id} max_api_not_configured ({out})",
                         flush=True,
+                    )
+                    _journal.error(
+                        f"processor\tFAILED"
+                        f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                        f"\treason=max_api_not_configured\tmode=prod\toutcome={out}"
                     )
                     continue
 
@@ -762,8 +777,15 @@ def main():
                     c2.commit()
                     c2.close()
                     print(f"ERROR event={event_id} (no recipient row): {e}", flush=True)
+                    _journal.error(
+                        f"processor\tERROR"
+                        f"\tcamera={row.get('camera_code') if row else '?'}"
+                        f"\tfile={row.get('file_name') if row else '?'}"
+                        f"\terror={err}"
+                    )
                 else:
                     print(f"ERROR before event picked: {e}", flush=True)
+                    _journal.error(f"processor\tERROR\tcamera=?\tfile=?\terror={err}")
             except Exception as e2:
                 print(f"ERROR nested: {e2}", flush=True)
             finally:

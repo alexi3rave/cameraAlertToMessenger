@@ -278,6 +278,11 @@ while True:
 
                 except Exception as db_err:
                     print(f"db error {camera_code}: {db_err}", flush=True)
+                    _journal.error(
+                        f"watcher\tERROR"
+                        f"\tcamera={camera_code}\tfile={f}"
+                        f"\terror={str(db_err)[:300]}"
+                    )
                     try:
                         conn.rollback()
                     except Exception:
@@ -293,6 +298,7 @@ while True:
 
     except Exception as e:
         print(f"watcher error: {e}", flush=True)
+        _journal.error(f"watcher\tERROR\tcamera=?\tfile=?\terror={str(e)[:300]}")
         conn = None
         if WATCH_LOOP_SLEEP_SECONDS > 0:
             time.sleep(WATCH_LOOP_SLEEP_SECONDS)

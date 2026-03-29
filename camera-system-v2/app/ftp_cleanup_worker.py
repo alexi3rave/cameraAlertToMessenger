@@ -213,6 +213,7 @@ def main():
         except Exception as e:
             print(f"ftp_cleanup ERROR: {e}", flush=True)
             journal.error(f"ERROR\t{e}")
+            ev_journal.error(f"ftp_cleanup\tERROR\tcamera=?\tfile=?\terror={str(e)[:300]}")
             if conn is not None:
                 try:
                     conn.rollback()
