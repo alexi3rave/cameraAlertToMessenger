@@ -1,5 +1,22 @@
 PROJECT: camera-system-v2
 
+---
+
+структура документации (repo-cameras/):
+
+project.md               — описание проекта, масштаб, roadmap, текущий статус
+ARCHITECTURE.md          — архитектура системы, компоненты, принципы
+DB model.md              — модель данных, таблицы, статусные контракты
+RULES .md                — правила разработки, ограничения, env-дисциплина
+SERVER_STATUS_*.md       — состояние сервера, окружение, операционные команды
+CURRENT STATE .md        — актуальный статус реализации, что сделано / что осталось
+STATUS_CONTRACT.md       — зафиксированные контракты статусов events и deliveries
+
+репо сервисов:
+camera-system-v2/RUNBOOK.md  — быстрые операционные команды (шпаргалка)
+
+---
+
 тип:
 объектная система обработки событий с камер с отправкой уведомлений в MAX
 
@@ -24,7 +41,10 @@ camera → FTP → watcher → event registry → processor → deliveries → M
 
 v2 НЕ заменяет n8n на текущем этапе.
 
-текущий статус (обновлено):
+текущий статус (обновлено: 2026-03-29):
+
+Stage 3 — ЗАКРЫТ 
+текущая цель — Stage 4 (UI)
 
 ✅ отправка фото в MAX в v2 успешно реализована и работает end-to-end
 ✅ watcher стабильно создает события (ready)
@@ -34,9 +54,12 @@ v2 НЕ заменяет n8n на текущем этапе.
    deliveries = pending/started/sent/failed
 ✅ MAX upload переведен на актуальный flow (/uploads?type=image)
 ✅ добавлено время события в текст сообщения (без имени файла)
-✅ v2 переведен на единый источник FTP через `FTP_SOURCE_PATH` (текущий runtime: `/home/alex/camera-system/ftp-uploads`)
+✅ v2 переведен на единый источник FTP через `FTP_SOURCE_PATH` (runtime: `/home/alex/camera-system/ftp-uploads`)
 ✅ n8n и `camera-ftp` работают в общей docker-сети `camera-infra`, host для n8n: `camera-ftp`
 ✅ время в уведомлениях v2 отображается в часовом поясе `Europe/Moscow` (MSK)
+✅ watcher оптимизирован: mtime-курсор, seen_keys+seen_names дедуп, latency <1 сек (было ~3 мин)
+✅ тестовые файлы (.txt): отдельное text-only уведомление «✅ Test event received»
+✅ исправлены дубли уведомлений (FTP mtime update больше не создает повторный event)
 
 цель Stage 3:
 

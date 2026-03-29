@@ -32,19 +32,22 @@ MAX
 
 watcher
 
-обнаруживает файлы
-проверяет стабильность файла
+обнаруживает файлы (mtime-курсор: только новые файлы)
+проверяет стабильность файла (stabilize timeout)
 извлекает camera_code
 определяет site
 создает event
+дедупликация: seen_keys (fingerprint) + seen_names (camera_code+filename)
+persistent DB connection
 
 ---
 
 processor
 
-определяет recipients
+определяет recipients (camera_routes → site default → tenant default)
 создает deliveries
 вызывает MAX API (текст + изображение)
+тестовые файлы (TEST_FILE_REGEX): text-only уведомление без загрузки фото
 
 ---
 
@@ -81,6 +84,17 @@ camera-v2-retry
 camera-v2-ftp-cleanup
 camera-ftp
 camera-n8n
+
+---
+
+event_journal
+
+единый текстовый журнал: logs/events/events.log
+пишут: watcher, processor, ftp_cleanup
+формат: TIMESTAMP  SERVICE  ACTION  field=value ...
+действия: DISCOVERED / SENT / QUARANTINE / FAILED / ERROR / DELETED
+ротация: 10 МБ × 10 файлов (RotatingFileHandler)
+модуль: app/event_journal.py (shared, импортируется всеми сервисами)
 
 ---
 

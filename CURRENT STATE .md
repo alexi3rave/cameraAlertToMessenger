@@ -1,10 +1,20 @@
 CURRENT STATE
 
-Stage 3 partially complete.
+обновлено: 2026-03-30
 
-контур v2 работает параллельно с n8n.
+---
 
-развернутые сервисы:
+## Статус этапов
+
+Stage 1 — ЗАКРЫТ 
+Stage 2 — ЗАКРЫТ 
+Stage 3 — ЗАКРЫТ 
+
+текущая цель: Stage 4 (UI)
+
+---
+
+## Развернутые сервисы
 
 camera-v2-postgres
 camera-v2-watcher
@@ -14,196 +24,105 @@ camera-v2-ftp-cleanup
 camera-ftp
 camera-n8n
 
-repo:
-
-/opt/cursor-agent/camera-system-v2
+repo на сервере: /opt/cursor-agent/camera-system-v2
+ветка: feat/watcher-perf-dedup-test-events
 
 ---
 
-реализовано:
+## Что реализовано
+
+### pipeline v2 (Stage 1–3)
 
 events registry
 deliveries registry
-
-watcher:
-
-обнаружение файлов
-извлечение camera_code
-извлечение site из пути
-регистрация event
-
-processor:
-
-создание deliveries
-отправка в MAX
-
-retry_worker:
-
-обработка failed_retryable
-
-auto onboarding:
-
-новая камера создается автоматически
-новый site создается автоматически
-
-dedup:
-
-camera_code + file_name + size + mtime
-
-поддержка вложенных FTP папок
-
-single env файл:
-
-env/app.env
-
----
-
-выявленные расхождения:
-
-1. статус deliveries:
-
-в документах ранее встречался uploaded
-целевой контракт: pending / started / sent / failed
-
-решение:
-
-используем pending как единственный начальный статус
-uploaded не используем как основной
-
-2. lifecycle events описан по-разному в разных документах
-
-зафиксирован единый контракт:
-
-discovered
-ready
-processing
-sent
-failed_retryable
-quarantine
-
-3. ftp cleanup сервис существует, но требуется подтвердить:
-
-TTL = 7 дней
-ftp_removed_at корректно заполняется
-
-4. доступ к env/app.env ограничен правами
-
-это мешает runtime аудиту:
-
-retry backoff
-TTL
-SHADOW_MODE
-
----
-
-текущая цель:
-
-закрыть Stage 3 полностью
-
----
-
-Stage 3 definition of done:
-
-retry
-
-failed_retryable события повторно обрабатываются
-
-ftp cleanup
-
-файлы старше 7 дней удаляются
-events.ftp_removed_at заполняется
-
-routing
-
-невозможно отправить фото не тому получателю
-
-dedup
-
-повторные файлы не создают новые deliveries
-
-auto onboarding
-
-новая камера начинает отправку без ручного SQL
-
-устойчивость
-
+routing: camera_routes → site.default_recipient → tenant.default_recipient
+retry_worker: обработка failed_retryable с backoff
+ftp_cleanup_worker: TTL = 7 дней
+auto onboarding: новая камера и site создаются автоматически
+SHADOW_MODE: dry_run / shadow / prod
+статус contracts зафиксированы (см. DB model.md)
+single env файл: env/app.env
 restart контейнеров не ломает pipeline
+n8n контур не затронут
 
-n8n не затронут
+### watcher (оптимизирован 2026-03-29)
 
----
+mtime-курсор: сканируется только новые файлы (WATCH_USE_MTIME_CURSOR=1)
+seen_keys: O(1) дедупликация по fingerprint (camera_code + file_name + size + mtime)
+seen_names: O(1) дедупликация по (camera_code, file_name) — исключает дубли при обновлении mtime FTP-сервером
+persistent DB connection (reconnect on failure)
+быстрые дефолты: stabilize=0.2s, loop=1s
+latency: ~3 минуты → <1 секунды (FTP → MAX)
 
-NEXT ITERATION PLAN
+### processor (обновлен 2026-03-29)
 
-шаг 1
+test file support: TEST_FILE_REGEX (default: \.txt$)
+text-only уведомление для тестовых файлов: «✅ Test event received»
+фото загружается только для реальных событий
 
-зафиксировать STATUS CONTRACT
+### журнал событий (добавлен 2026-03-30)
 
-единый список статусов events
-единый список статусов deliveries
+единый текстовый файл: logs/events/events.log
+записывают все три сервиса: watcher, processor, ftp_cleanup
+ротация: 10 МБ × 10 файлов
 
-результат:
+записи в журнале:
+DISCOVERED — watcher: новый файл обнаружен и принят в обработку
+SENT        — processor: уведомление доставлено в MAX
+QUARANTINE  — processor: событие ушло в карантин (нет маршрута, нет chat_id)
+FAILED      — processor: ошибка доставки (нет API-ключа, неверный режим и т.п.)
+ERROR       — watcher / processor / ftp_cleanup: необработанное исключение
+DELETED     — ftp_cleanup: файл физически удалён с диска
 
-STATUS_CONTRACT.md
+настройка через env:
+EVENT_JOURNAL_DIR (default: /events → хост: logs/events/)
+EVENT_JOURNAL_MAX_BYTES (default: 10 МБ)
+EVENT_JOURNAL_BACKUP_COUNT (default: 10)
 
----
+отдельный операционный лог очистки: logs/ftp_cleanup/ftp_cleanup.log
+(содержит BATCH-итоги, REMOVE_ERROR, ALREADY_GONE)
 
-шаг 2
+### репо
 
-runtime аудит
-
-SQL:
-
-распределение events.status
-распределение deliveries.status
-failed_retryable count
-quarantine count
-ftp_removed_at заполнение
-
-логи:
-
-watcher
-processor
-retry
-ftp_cleanup
-
-результат:
-
-таблица
-
-document vs runtime
-
----
-
-шаг 3
-
-закрыть Stage 3:
-
-retry подтвержден логами
-
-ftp cleanup подтвержден SQL
-
-routing проверен на тестовой камере
-
-dedup подтвержден повторной загрузкой файла
-
-auto onboarding подтвержден новой камерой
+Dockerfile + requirements.txt добавлены
+.gitignore добавлен
+RUNBOOK.md добавлен (операционные команды)
+event_journal.py добавлен (shared journal module)
 
 ---
 
-шаг 4
+## Контракты (зафиксированы)
 
-синхронизировать документацию:
+events.status:
+discovered → ready → processing → sent / failed_retryable → quarantine
 
-CURRENT STATE
-Stage reports
+deliveries.status:
+pending → started → sent / failed
 
-убрать противоречия
+pending — единственный начальный статус
+uploaded — не используется
 
 ---
 
-после закрытия Stage 3:
+## Что осталось
 
-решение:
+Stage 4:
+UI управления — маршруты, получатели, камеры, просмотр событий, ручные действия по quarantine
 
-Stage 4 с UI
+После Stage 3 (в приоритете):
+отключение n8n — оба контура сейчас посылают уведомления параллельно; нужен migration plan
+simplified schema Phase B/C — переключить runtime с legacy на photo_sources/photo_events
+мониторинг — метрики (lag, error rate), алерты на quarantine и failed_retryable
+
+Низкий приоритет:
+multi-FTP — несколько источников с отдельными маршрутами
+health-check токена MAX
+регламент ротации токенов
+
+---
+
+## Известные ограничения
+
+нет UI — правки маршрутов и получателей через SQL
+n8n параллельно — риск дублирующих уведомлений при совпадении получателей
+доступ к env/app.env ограничен правами на сервере (chmod 600)
