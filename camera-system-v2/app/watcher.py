@@ -3,6 +3,7 @@ import re
 import time
 import hashlib
 import psycopg2
+import event_journal
 
 WATCH_PATH = "/source"
 
@@ -32,6 +33,7 @@ DB_HOST = os.environ.get("POSTGRES_HOST", "postgres")
 DB_PORT = os.environ.get("POSTGRES_PORT", "5432")
 
 print(f"watcher started mode={PIPELINE_SCHEMA_MODE}", flush=True)
+_journal = event_journal.get_journal()
 
 # in-process dedup by event_key (full fingerprint) and by (camera_code, filename)
 seen_keys: set = set()
@@ -268,6 +270,11 @@ while True:
                     seen_keys.add(event_key)
                     seen_names.add(name_key)
                     print(f"event ok site={site_code} cam={camera_code}", flush=True)
+                    _journal.info(
+                        f"watcher\tDISCOVERED"
+                        f"\tcamera={camera_code}\tfile={f}"
+                        f"\tsite={site_code}\tpath={path}"
+                    )
 
                 except Exception as db_err:
                     print(f"db error {camera_code}: {db_err}", flush=True)

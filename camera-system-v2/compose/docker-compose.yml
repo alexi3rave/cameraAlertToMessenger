@@ -37,9 +37,11 @@ services:
       WATCH_LOOP_SLEEP_SECONDS: "1"
       WATCH_INITIAL_LOOKBACK_SECONDS: "300"
       TEST_FILE_REGEX: "\\.txt$"
+      EVENT_JOURNAL_DIR: "/events"
     volumes:
       - ${FTP_SOURCE_PATH:-/home/alex/camera-system/ftp-uploads}:/source:ro
       - ../logs/watcher:/logs
+      - ../logs/events:/events
       - ../state/watcher:/state
     depends_on:
       - postgres
@@ -59,9 +61,11 @@ services:
       MAX_API_BASE: "https://platform-api.max.ru"
       POSTGRES_HOST: "${POSTGRES_HOST:-cf1faf585fc8_camera-v2-postgres}"
       TEST_FILE_REGEX: "\\.txt$"
+      EVENT_JOURNAL_DIR: "/events"
     volumes:
       - ${FTP_SOURCE_PATH:-/home/alex/camera-system/ftp-uploads}:/source:ro
       - ../logs/processor:/logs
+      - ../logs/events:/events
     depends_on:
       - postgres
     command: ["python", "-u", "processor.py"]
@@ -90,9 +94,13 @@ services:
     working_dir: /app
     env_file:
       - ../env/app.env
+    environment:
+      EVENT_JOURNAL_DIR: "/events"
+      FTP_CLEANUP_LOG_DIR: "/logs"
     volumes:
       - ${FTP_SOURCE_PATH:-/home/alex/camera-system/ftp-uploads}:/source
       - ../logs/ftp_cleanup:/logs
+      - ../logs/events:/events
     depends_on:
       - postgres
     command: ["python", "-u", "ftp_cleanup_worker.py"]

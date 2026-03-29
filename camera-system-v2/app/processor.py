@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import event_journal
 
 from max_client import is_configured, send_message, send_message_with_photo
 from retry_policy import delay_before_next_retry, fetch_retry_policy
@@ -21,6 +22,7 @@ SHADOW_TEST_CHAT_ID = os.getenv("SHADOW_TEST_CHAT_ID", "").strip()
 PIPELINE_SCHEMA_MODE = os.getenv("PIPELINE_SCHEMA_MODE", "legacy").strip().lower()
 PROCESSOR_IDLE_SLEEP_SECONDS = float(os.getenv("PROCESSOR_IDLE_SLEEP_SECONDS", "2"))
 PROCESSOR_ERROR_SLEEP_SECONDS = float(os.getenv("PROCESSOR_ERROR_SLEEP_SECONDS", "5"))
+_journal = event_journal.get_journal()
 EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
 TEST_FILE_REGEX = re.compile(
     os.getenv("TEST_FILE_REGEX", r"(^test_|_test_|healthcheck|probe)"),
@@ -528,6 +530,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"QUARANTINE: {event_id} route_not_found", flush=True)
+                _journal.info(
+                    f"processor\tQUARANTINE"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\treason=route_not_found"
+                )
                 continue
 
             if SHADOW_MODE == "prod" and not row.get("max_chat_id"):
@@ -542,6 +549,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"QUARANTINE: {event_id} recipient_missing_chat_id", flush=True)
+                _journal.info(
+                    f"processor\tQUARANTINE"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\treason=recipient_missing_chat_id"
+                )
                 continue
 
             policy = fetch_retry_policy(conn)
@@ -578,6 +590,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"SENT dry_run: {event_id}", flush=True)
+                _journal.info(
+                    f"processor\tSENT"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\tmode=dry_run"
+                )
                 continue
 
             if SHADOW_MODE == "shadow":
@@ -636,6 +653,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"SENT shadow: {event_id}", flush=True)
+                _journal.info(
+                    f"processor\tSENT"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\tmode=shadow"
+                )
                 continue
 
             if SHADOW_MODE == "prod":
@@ -672,6 +694,11 @@ def main():
                 conn.commit()
                 conn.close()
                 print(f"SENT prod: {event_id}", flush=True)
+                _journal.info(
+                    f"processor\tSENT"
+                    f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                    f"\tmode=prod"
+                )
                 continue
 
             finish_delivery(conn, event_id, attempt_no, "failed", "unsupported_mode")
@@ -685,6 +712,11 @@ def main():
             conn.commit()
             conn.close()
             print(f"FAILED: {event_id} unsupported_mode ({out})", flush=True)
+            _journal.info(
+                f"processor\tFAILED"
+                f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                f"\treason=unsupported_mode\toutcome={out}"
+            )
 
         except Exception as e:
             err = str(e)[:500]
@@ -716,6 +748,12 @@ def main():
                     c2.commit()
                     c2.close()
                     print(f"ERROR event={event_id}: {e}", flush=True)
+                    _journal.error(
+                        f"processor\tERROR"
+                        f"\tcamera={row.get('camera_code') if row else '?'}"
+                        f"\tfile={row.get('file_name') if row else '?'}"
+                        f"\terror={err}"
+                    )
                 elif event_id:
                     c2 = db()
                     c2.autocommit = False

@@ -10,6 +10,7 @@ import logging.handlers
 import os
 import time
 import psycopg2
+import event_journal
 
 DB_NAME = os.getenv("POSTGRES_DB", os.getenv("DB_NAME", "camera_v2"))
 DB_USER = os.getenv("POSTGRES_USER", os.getenv("DB_USER", "camera"))
@@ -89,6 +90,7 @@ def path_is_under_root(candidate: str, root_real: str) -> bool:
 
 def main():
     journal = _setup_file_logger()
+    ev_journal = event_journal.get_journal()
     print(
         f"ftp_cleanup started root={FTP_ROOT} retention_days={RETENTION_DAYS} "
         f"interval={INTERVAL_SEC}s log={LOG_FILE}",
@@ -157,6 +159,11 @@ def main():
                         f"\tcamera={camera_code}\tfile={file_name}"
                         f"\tfirst_seen={first_seen_at}"
                     )
+                    ev_journal.info(
+                        f"ftp_cleanup\tDELETED"
+                        f"\tcamera={camera_code}\tfile={file_name}"
+                        f"\tfirst_seen={first_seen_at}\tnote=already_gone"
+                    )
                     removed += 1
                     continue
                 except OSError as e:
@@ -187,6 +194,11 @@ def main():
                     )
                 journal.info(
                     f"DELETED"
+                    f"\tcamera={camera_code}\tfile={file_name}"
+                    f"\tfirst_seen={first_seen_at}\tpath={full_path}"
+                )
+                ev_journal.info(
+                    f"ftp_cleanup\tDELETED"
                     f"\tcamera={camera_code}\tfile={file_name}"
                     f"\tfirst_seen={first_seen_at}\tpath={full_path}"
                 )
