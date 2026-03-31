@@ -32,12 +32,12 @@ MAX
 
 watcher
 
-обнаруживает файлы (mtime-курсор: только новые файлы)
+обнаруживает файлы (сканирует WATCH_PATH, без silent-drop)
 проверяет стабильность файла (stabilize timeout)
 извлекает camera_code
 определяет site
-создает event
-дедупликация: seen_keys (fingerprint) + seen_names (camera_code+filename)
+создает event (обычно ready, для слишком старых файлов quarantine с reason=too_old)
+дедупликация: seen_keys (camera_code+file_name+size+checksum) + seen_names (camera_code+filename)
 persistent DB connection
 
 ---
@@ -56,6 +56,7 @@ retry_worker
 обрабатывает events со статусом failed_retryable
 повторяет отправку
 использует backoff
+reaper: возвращает stale processing в failed_retryable по locked_at
 
 ---
 
@@ -63,6 +64,7 @@ ftp_cleanup_worker
 
 удаляет файлы старше TTL
 TTL = 7 дней
+для quarantine поддерживается отдельный TTL (FTP_QUARANTINE_RETENTION_DAYS)
 
 после удаления:
 events.ftp_removed_at заполняется

@@ -72,9 +72,9 @@ def extract_site_from_path(full_path):
     return "default"
 
 
-def make_event_key(camera_code,file_name,size,mtime):
+def make_event_key(camera_code, file_name, size, checksum):
 
-    raw=f"{camera_code}|{file_name}|{size}|{mtime}"
+    raw=f"{camera_code}|{file_name}|{size}|{checksum}"
 
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -112,7 +112,9 @@ site_ins AS (
 site_final AS (
     SELECT id FROM site_ins
     UNION ALL
-    SELECT id FROM sites WHERE code=%s
+    SELECT s.id FROM sites s
+    JOIN src ON s.tenant_id = src.tenant_id
+    WHERE s.code=%s
     LIMIT 1
 ),
 cam_ins AS (
@@ -122,18 +124,29 @@ cam_ins AS (
     RETURNING id
 ),
 cam_final AS (
-    SELECT id FROM cameras WHERE camera_code=%s
+    SELECT c.id FROM cameras c
+    JOIN src ON c.tenant_id = src.tenant_id
+    JOIN site_final sf ON sf.id = c.site_id
+    WHERE c.camera_code=%s
     UNION ALL
     SELECT id FROM cam_ins
     LIMIT 1
 )
 INSERT INTO events(
     id, event_key, file_name, full_path, file_size,
-    status, camera_code, camera_id, checksum_sha256
+    status, camera_code, camera_id, checksum_sha256, quarantine_reason
 )
 SELECT
-    uuid_generate_v4(), %s, %s, %s, %s, 'ready', %s,
-    (SELECT id FROM cam_final), %s
+    uuid_generate_v4(), %s, %s, %s, %s, %s, %s,
+    (SELECT id FROM cam_final), %s, %s
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM events
+    WHERE camera_id = (SELECT id FROM cam_final)
+      AND file_name = %s
+      AND file_size = %s
+      AND checksum_sha256 = %s
+)
 ON CONFLICT(event_key) DO NOTHING
 """
 
@@ -166,23 +179,13 @@ while True:
                 except OSError:
                     continue
 
-                # mtime cursor: skip files not modified since last scan
-                if WATCH_USE_MTIME_CURSOR and mtime1 < scan_from_ts:
-                    continue
-
-                # max age filter
-                if (loop_started_at - mtime1) > MAX_FILE_AGE_SECONDS:
-                    continue
+                too_old = (loop_started_at - mtime1) > MAX_FILE_AGE_SECONDS
 
                 # ── fast in-memory dedup (no I/O, no DB round-trip) ──
                 camera_code = detect_camera_code(f)
                 name_key = (camera_code, f)
                 if name_key in seen_names:
                     continue
-                event_key = make_event_key(camera_code, f, size1, int(mtime1))
-                if event_key in seen_keys:
-                    continue
-
                 # stabilisation: verify file stopped changing
                 if FILE_STABILIZE_SECONDS > 0:
                     time.sleep(FILE_STABILIZE_SECONDS)
@@ -203,6 +206,13 @@ while True:
                 except OSError:
                     continue
 
+                event_key = make_event_key(camera_code, f, size2, checksum)
+                if event_key in seen_keys:
+                    continue
+
+                status = "quarantine" if too_old else "ready"
+                quarantine_reason = "too_old" if too_old else None
+
                 try:
                     with conn:
                         with conn.cursor() as cur:
@@ -211,7 +221,9 @@ while True:
                                 site_code, site_code, site_code, site_code,
                                 camera_code, camera_code, camera_code,
                                 camera_code,
-                                event_key, f, path, size2, camera_code, checksum,
+                                event_key, f, path, size2, status, camera_code,
+                                checksum, quarantine_reason,
+                                f, size2, checksum,
                             ))
 
                             # Dual-write to simplified schema (Phase A, non-critical)
@@ -269,11 +281,17 @@ while True:
 
                     seen_keys.add(event_key)
                     seen_names.add(name_key)
-                    print(f"event ok site={site_code} cam={camera_code}", flush=True)
+                    print(
+                        f"event ok site={site_code} cam={camera_code} "
+                        f"status={status} key={event_key}",
+                        flush=True,
+                    )
                     _journal.info(
                         f"watcher\tDISCOVERED"
                         f"\tcamera={camera_code}\tfile={f}"
                         f"\tsite={site_code}\tpath={path}"
+                        f"\tstatus={status}\treason={quarantine_reason or '-'}"
+                        f"\tkey={event_key}"
                     )
 
                 except Exception as db_err:
@@ -281,6 +299,7 @@ while True:
                     _journal.error(
                         f"watcher\tERROR"
                         f"\tcamera={camera_code}\tfile={f}"
+                        f"\tkey={event_key or '?'}"
                         f"\terror={str(db_err)[:300]}"
                     )
                     try:

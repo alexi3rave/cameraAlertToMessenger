@@ -1,5 +1,6 @@
 import os
 import mimetypes
+import time
 import requests
 
 MAX_API_BASE = os.getenv("MAX_API_BASE", "").rstrip("/")
@@ -7,6 +8,9 @@ MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
 MAX_UPLOAD_URL_PATH = os.getenv("MAX_UPLOAD_URL_PATH", "")
 MAX_SEND_MESSAGE_PATH = os.getenv("MAX_SEND_MESSAGE_PATH", "")
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
+MAX_RETRY_BASE_DELAY_SECONDS = float(os.getenv("MAX_RETRY_BASE_DELAY_SECONDS", "1"))
+MAX_RETRY_MAX_DELAY_SECONDS = float(os.getenv("MAX_RETRY_MAX_DELAY_SECONDS", "8"))
 
 # Документация MAX: https://dev.max.ru/docs-api/methods/POST/messages
 # Authorization: токен целиком, без префикса "Bearer " (если нужен Bearer — MAX_AUTH_HEADER_STYLE=bearer)
@@ -36,6 +40,54 @@ def _headers_json():
 def _headers_upload():
     # Для multipart/form-data не задаём Content-Type вручную.
     return {"Authorization": _auth_value()}
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in (429, 500, 502, 503, 504)
+
+
+def _retry_after_seconds(resp) -> float:
+    if resp is None:
+        return 0.0
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(v, MAX_RETRY_MAX_DELAY_SECONDS))
+
+
+def _backoff_seconds(attempt_no: int, resp=None) -> float:
+    retry_after = _retry_after_seconds(resp)
+    if retry_after > 0:
+        return retry_after
+    delay = MAX_RETRY_BASE_DELAY_SECONDS * (2 ** max(0, attempt_no - 1))
+    return min(delay, MAX_RETRY_MAX_DELAY_SECONDS)
+
+
+def _request_with_retry(method: str, url: str, **kwargs):
+    attempts = max(0, MAX_RETRY_ATTEMPTS)
+    for attempt in range(0, attempts + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.RequestException:
+            if attempt >= attempts:
+                raise
+            time.sleep(_backoff_seconds(attempt + 1))
+            continue
+
+        if _is_retryable_status(resp.status_code):
+            if attempt >= attempts:
+                resp.raise_for_status()
+            time.sleep(_backoff_seconds(attempt + 1, resp))
+            continue
+
+        resp.raise_for_status()
+        return resp
+
+    raise RuntimeError("MAX request retry loop exited unexpectedly")
 
 
 def _recipient_params(chat_id: str):
@@ -75,34 +127,34 @@ def upload_photo(file_path: str):
     content_type = mime or "application/octet-stream"
 
     # New MAX flow: POST /uploads?type=image -> get upload URL -> upload file there.
-    init_resp = requests.post(
+    init_resp = _request_with_retry(
+        "POST",
         url,
         headers=_headers_upload(),
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    init_resp.raise_for_status()
     init_data = init_resp.json()
 
     upload_url = init_data.get("url") if isinstance(init_data, dict) else None
     if upload_url:
         with open(file_path, "rb") as fh:
-            upload_resp = requests.post(
+            upload_resp = _request_with_retry(
+                "POST",
                 upload_url,
                 files={"data": (os.path.basename(file_path), fh, content_type)},
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
-        upload_resp.raise_for_status()
         return _extract_upload_payload(upload_resp.json())
 
     # Backward compatibility: legacy one-step upload endpoint.
     with open(file_path, "rb") as fh:
-        legacy_resp = requests.post(
+        legacy_resp = _request_with_retry(
+            "POST",
             url,
             headers=_headers_upload(),
             files={"file": (os.path.basename(file_path), fh, content_type)},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-    legacy_resp.raise_for_status()
     return _extract_upload_payload(legacy_resp.json())
 
 
@@ -124,14 +176,14 @@ def send_message(chat_id: str, text: str, photos=None, token=None, attachment_pa
                 "payload": payload,
             }
         ]
-    resp = requests.post(
+    resp = _request_with_retry(
+        "POST",
         url,
         headers=_headers_json(),
         params=params,
         json=body,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    resp.raise_for_status()
     return resp.json()
 
 

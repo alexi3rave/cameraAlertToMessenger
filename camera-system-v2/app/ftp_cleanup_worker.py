@@ -20,6 +20,9 @@ DB_PORT = int(os.getenv("POSTGRES_PORT", os.getenv("DB_PORT", "5432")))
 
 FTP_ROOT = os.getenv("FTP_CLEANUP_ROOT", "/source").rstrip("/") or "/source"
 RETENTION_DAYS = int(os.getenv("FTP_RETENTION_DAYS", "7"))
+QUARANTINE_RETENTION_DAYS = int(
+    os.getenv("FTP_QUARANTINE_RETENTION_DAYS", str(RETENTION_DAYS))
+)
 INTERVAL_SEC = int(os.getenv("FTP_CLEANUP_INTERVAL_SEC", "3600"))
 BATCH = int(os.getenv("FTP_CLEANUP_BATCH", "200"))
 LOG_DIR = os.getenv("FTP_CLEANUP_LOG_DIR", "/logs")
@@ -93,6 +96,7 @@ def main():
     ev_journal = event_journal.get_journal()
     print(
         f"ftp_cleanup started root={FTP_ROOT} retention_days={RETENTION_DAYS} "
+        f"quarantine_retention_days={QUARANTINE_RETENTION_DAYS} "
         f"interval={INTERVAL_SEC}s log={LOG_FILE}",
         flush=True,
     )
@@ -117,21 +121,27 @@ def main():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, full_path, file_name, camera_code, first_seen_at
+                    SELECT id, full_path, file_name, camera_code, first_seen_at, status
                     FROM events
                     WHERE ftp_removed_at IS NULL
-                      AND status = ANY(%s)
-                      AND first_seen_at < (now() - %s::interval)
+                      AND (
+                        (status = 'sent' AND first_seen_at < (now() - %s::interval))
+                        OR (status = 'quarantine' AND first_seen_at < (now() - %s::interval))
+                      )
                     ORDER BY first_seen_at
                     LIMIT %s
                     """,
-                    (list(TERMINAL), f"{RETENTION_DAYS} days", BATCH),
+                    (
+                        f"{RETENTION_DAYS} days",
+                        f"{QUARANTINE_RETENTION_DAYS} days",
+                        BATCH,
+                    ),
                 )
                 rows = cur.fetchall()
 
             removed = 0
             skipped = 0
-            for event_id, full_path, file_name, camera_code, first_seen_at in rows:
+            for event_id, full_path, file_name, camera_code, first_seen_at, status in rows:
                 if not full_path or not isinstance(full_path, str):
                     skipped += 1
                     continue
@@ -156,12 +166,12 @@ def main():
                         )
                     journal.info(
                         f"ALREADY_GONE"
-                        f"\tcamera={camera_code}\tfile={file_name}"
+                        f"\tstatus={status}\tcamera={camera_code}\tfile={file_name}"
                         f"\tfirst_seen={first_seen_at}"
                     )
                     ev_journal.info(
                         f"ftp_cleanup\tDELETED"
-                        f"\tcamera={camera_code}\tfile={file_name}"
+                        f"\tstatus={status}\tcamera={camera_code}\tfile={file_name}"
                         f"\tfirst_seen={first_seen_at}\tnote=already_gone"
                     )
                     removed += 1
@@ -194,12 +204,12 @@ def main():
                     )
                 journal.info(
                     f"DELETED"
-                    f"\tcamera={camera_code}\tfile={file_name}"
+                    f"\tstatus={status}\tcamera={camera_code}\tfile={file_name}"
                     f"\tfirst_seen={first_seen_at}\tpath={full_path}"
                 )
                 ev_journal.info(
                     f"ftp_cleanup\tDELETED"
-                    f"\tcamera={camera_code}\tfile={file_name}"
+                    f"\tstatus={status}\tcamera={camera_code}\tfile={file_name}"
                     f"\tfirst_seen={first_seen_at}\tpath={full_path}"
                 )
                 removed += 1

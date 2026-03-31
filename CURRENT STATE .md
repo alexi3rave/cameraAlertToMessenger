@@ -36,8 +36,9 @@ repo на сервере: /opt/cursor-agent/camera-system-v2
 events registry
 deliveries registry
 routing: camera_routes → site.default_recipient → tenant.default_recipient
-retry_worker: обработка failed_retryable с backoff
-ftp_cleanup_worker: TTL = 7 дней
+retry_worker: обработка failed_retryable с backoff + reaper stale processing по locked_at
+ftp_cleanup_worker: TTL = 7 дней + отдельный quarantine TTL (FTP_QUARANTINE_RETENTION_DAYS)
+
 auto onboarding: новая камера и site создаются автоматически
 SHADOW_MODE: dry_run / shadow / prod
 статус contracts зафиксированы (см. DB model.md)
@@ -47,9 +48,10 @@ n8n контур не затронут
 
 ### watcher (оптимизирован 2026-03-29)
 
-mtime-курсор: сканируется только новые файлы (WATCH_USE_MTIME_CURSOR=1)
-seen_keys: O(1) дедупликация по fingerprint (camera_code + file_name + size + mtime)
+mtime-курсор не используется как фильтр silent-skip (чтобы не терять события после даунтайма)
+seen_keys: O(1) дедупликация по fingerprint (camera_code + file_name + size + checksum_sha256)
 seen_names: O(1) дедупликация по (camera_code, file_name) — исключает дубли при обновлении mtime FTP-сервером
+слишком старые файлы не теряются: создаются в events как quarantine (quarantine_reason=too_old)
 persistent DB connection (reconnect on failure)
 быстрые дефолты: stabilize=0.2s, loop=1s
 latency: ~3 минуты → <1 секунды (FTP → MAX)

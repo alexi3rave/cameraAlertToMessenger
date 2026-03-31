@@ -2,6 +2,7 @@ import os
 import re
 import time
 import uuid
+import socket
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import psycopg2
@@ -24,6 +25,7 @@ PROCESSOR_IDLE_SLEEP_SECONDS = float(os.getenv("PROCESSOR_IDLE_SLEEP_SECONDS", "
 PROCESSOR_ERROR_SLEEP_SECONDS = float(os.getenv("PROCESSOR_ERROR_SLEEP_SECONDS", "5"))
 _journal = event_journal.get_journal()
 EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
+WORKER_ID = os.getenv("PROCESSOR_WORKER_ID", f"processor-{socket.gethostname()}")
 TEST_FILE_REGEX = re.compile(
     os.getenv("TEST_FILE_REGEX", r"(^test_|_test_|healthcheck|probe)"),
     re.IGNORECASE,
@@ -131,14 +133,17 @@ def fetch_one_ready(conn):
                 FROM camera_routes cr
                 JOIN recipients r
                     ON r.id = cr.recipient_id AND r.is_active = true
+                   AND r.tenant_id = t.id
                 WHERE cr.camera_id = e.camera_id AND cr.is_active = true
                 ORDER BY cr.priority ASC, cr.id ASC
                 LIMIT 1
             ) route_rec ON true
             LEFT JOIN recipients r_site
                 ON r_site.id = s.default_recipient_id AND r_site.is_active = true
+               AND r_site.tenant_id = t.id
             LEFT JOIN recipients r_tenant
                 ON r_tenant.id = t.default_recipient_id AND r_tenant.is_active = true
+               AND r_tenant.tenant_id = t.id
             """
         )
         return cur.fetchone()
@@ -165,10 +170,21 @@ def set_status(
                     last_attempt_at = now(),
                     attempt_count = coalesce(attempt_count, 0) + 1,
                     quarantine_reason = coalesce(%s, quarantine_reason),
-                    next_retry_at = NULL
+                    next_retry_at = NULL,
+                    locked_at = CASE WHEN %s = 'processing' THEN now() ELSE NULL END,
+                    lock_owner = CASE WHEN %s = 'processing' THEN %s ELSE NULL END
                 WHERE id = %s
                 """,
-                (status, error_text, recipient_id, quarantine_reason, event_id),
+                (
+                    status,
+                    error_text,
+                    recipient_id,
+                    quarantine_reason,
+                    status,
+                    status,
+                    WORKER_ID,
+                    event_id,
+                ),
             )
             cur.execute(
                 """
@@ -191,10 +207,21 @@ def set_status(
                     last_error = %s,
                     recipient_id = coalesce(%s, recipient_id),
                     last_attempt_at = now(),
-                    quarantine_reason = coalesce(%s, quarantine_reason)
+                    quarantine_reason = coalesce(%s, quarantine_reason),
+                    locked_at = CASE WHEN %s = 'processing' THEN now() ELSE NULL END,
+                    lock_owner = CASE WHEN %s = 'processing' THEN %s ELSE NULL END
                 WHERE id = %s
                 """,
-                (status, error_text, recipient_id, quarantine_reason, event_id),
+                (
+                    status,
+                    error_text,
+                    recipient_id,
+                    quarantine_reason,
+                    status,
+                    status,
+                    WORKER_ID,
+                    event_id,
+                ),
             )
             cur.execute(
                 """
@@ -246,7 +273,9 @@ def set_failed_retryable(conn, event_id, error_text, recipient_id, delay_seconds
                 recipient_id = coalesce(%s, recipient_id),
                 last_attempt_at = now(),
                 next_retry_at = now() + (%s * interval '1 second'),
-                quarantine_reason = NULL
+                quarantine_reason = NULL,
+                locked_at = NULL,
+                lock_owner = NULL
             WHERE id = %s
             """,
             (error_text, recipient_id, delay_seconds, event_id),
@@ -275,7 +304,9 @@ def set_quarantine_after_retry_limit(conn, event_id, error_text, recipient_id=No
                 recipient_id = coalesce(%s, recipient_id),
                 last_attempt_at = now(),
                 quarantine_reason = coalesce(quarantine_reason, 'retry_limit_reached'),
-                next_retry_at = NULL
+                next_retry_at = NULL,
+                locked_at = NULL,
+                lock_owner = NULL
             WHERE id = %s
             """,
             (error_text, recipient_id, event_id),
@@ -322,7 +353,9 @@ def record_exception_failure(conn, event_id, recipient_id, err: str, policy):
                 last_attempt_at = now(),
                 next_retry_at = now() + (%s * interval '1 second'),
                 recipient_id = coalesce(%s, recipient_id),
-                quarantine_reason = NULL
+                quarantine_reason = NULL,
+                locked_at = NULL,
+                lock_owner = NULL
             WHERE id = %s
             """,
             (err, new_ac, delay, recipient_id, event_id),
@@ -472,7 +505,9 @@ def mark_sent(conn, event_id):
                 sent_at = now(),
                 last_error = null,
                 next_retry_at = null,
-                quarantine_reason = null
+                quarantine_reason = null,
+                locked_at = null,
+                lock_owner = null
             WHERE id = %s
             """,
             (event_id,),
@@ -532,6 +567,8 @@ def main():
                 print(f"QUARANTINE: {event_id} route_not_found", flush=True)
                 _journal.info(
                     f"processor\tQUARANTINE"
+                    f"\tevent_id={event_id}\trecipient_id=-"
+                    f"\ttrace_id={trace_id}\tattempt_no=-"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\treason=route_not_found"
                 )
@@ -551,6 +588,8 @@ def main():
                 print(f"QUARANTINE: {event_id} recipient_missing_chat_id", flush=True)
                 _journal.info(
                     f"processor\tQUARANTINE"
+                    f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                    f"\ttrace_id={trace_id}\tattempt_no=-"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\treason=recipient_missing_chat_id"
                 )
@@ -592,6 +631,8 @@ def main():
                 print(f"SENT dry_run: {event_id}", flush=True)
                 _journal.info(
                     f"processor\tSENT"
+                    f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                    f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\tmode=dry_run"
                 )
@@ -621,6 +662,8 @@ def main():
                     )
                     _journal.error(
                         f"processor\tFAILED"
+                        f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                        f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                         f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                         f"\treason=shadow_chat_not_configured\toutcome={out}"
                     )
@@ -649,6 +692,8 @@ def main():
                     )
                     _journal.error(
                         f"processor\tFAILED"
+                        f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                        f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                         f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                         f"\treason=max_api_not_configured\tmode=shadow\toutcome={out}"
                     )
@@ -665,6 +710,8 @@ def main():
                 print(f"SENT shadow: {event_id}", flush=True)
                 _journal.info(
                     f"processor\tSENT"
+                    f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                    f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\tmode=shadow"
                 )
@@ -694,6 +741,8 @@ def main():
                     )
                     _journal.error(
                         f"processor\tFAILED"
+                        f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                        f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                         f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                         f"\treason=max_api_not_configured\tmode=prod\toutcome={out}"
                     )
@@ -711,6 +760,8 @@ def main():
                 print(f"SENT prod: {event_id}", flush=True)
                 _journal.info(
                     f"processor\tSENT"
+                    f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                    f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\tmode=prod"
                 )
@@ -729,6 +780,8 @@ def main():
             print(f"FAILED: {event_id} unsupported_mode ({out})", flush=True)
             _journal.info(
                 f"processor\tFAILED"
+                f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                 f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                 f"\treason=unsupported_mode\toutcome={out}"
             )
@@ -765,6 +818,8 @@ def main():
                     print(f"ERROR event={event_id}: {e}", flush=True)
                     _journal.error(
                         f"processor\tERROR"
+                        f"\tevent_id={event_id}\trecipient_id={row.get('recipient_id')}"
+                        f"\ttrace_id={trace_id}\tattempt_no=-"
                         f"\tcamera={row.get('camera_code') if row else '?'}"
                         f"\tfile={row.get('file_name') if row else '?'}"
                         f"\terror={err}"
@@ -779,13 +834,19 @@ def main():
                     print(f"ERROR event={event_id} (no recipient row): {e}", flush=True)
                     _journal.error(
                         f"processor\tERROR"
+                        f"\tevent_id={event_id}\trecipient_id=-"
+                        f"\ttrace_id={trace_id}\tattempt_no=-"
                         f"\tcamera={row.get('camera_code') if row else '?'}"
                         f"\tfile={row.get('file_name') if row else '?'}"
                         f"\terror={err}"
                     )
                 else:
                     print(f"ERROR before event picked: {e}", flush=True)
-                    _journal.error(f"processor\tERROR\tcamera=?\tfile=?\terror={err}")
+                    _journal.error(
+                        f"processor\tERROR"
+                        f"\tevent_id=-\trecipient_id=-\ttrace_id={trace_id}\tattempt_no=-"
+                        f"\tcamera=?\tfile=?\terror={err}"
+                    )
             except Exception as e2:
                 print(f"ERROR nested: {e2}", flush=True)
             finally:

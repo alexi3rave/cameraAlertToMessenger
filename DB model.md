@@ -15,6 +15,10 @@ sent
 failed_retryable
 quarantine
 
+runtime note:
+- watcher пишет новые события сразу в ready
+- watcher пишет слишком старые файлы в quarantine (quarantine_reason=too_old)
+
 ---
 
 DELIVERY STATUS CONTRACT (зафиксировано)
@@ -40,6 +44,10 @@ file_size
 checksum
 status
 attempt_count
+locked_at
+lock_owner
+next_retry_at
+quarantine_reason
 created_at
 processed_at
 ftp_removed_at
@@ -92,7 +100,7 @@ dedup key:
 camera_code
 file_name
 file_size
-mtime
+checksum_sha256
 
 ---
 
