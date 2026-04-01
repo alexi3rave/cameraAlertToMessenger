@@ -70,6 +70,30 @@ services:
       - postgres
     command: ["python", "-u", "processor.py"]
 
+  processor2:
+    build:
+      context: ../app
+      dockerfile: Dockerfile
+    container_name: camera-v2-processor-2
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ../env/app.env
+    environment:
+      PROCESSOR_IDLE_SLEEP_SECONDS: "1"
+      MAX_API_BASE: "https://platform-api.max.ru"
+      POSTGRES_HOST: "${POSTGRES_HOST:-cf1faf585fc8_camera-v2-postgres}"
+      TEST_FILE_REGEX: "\\.txt$"
+      EVENT_JOURNAL_DIR: "/events"
+      PROCESSOR_WORKER_ID: "processor-2"
+    volumes:
+      - ${FTP_SOURCE_PATH:-/home/alex/camera-system/ftp-uploads}:/source:ro
+      - ../logs/processor:/logs
+      - ../logs/events:/events
+    depends_on:
+      - postgres
+    command: ["python", "-u", "processor.py"]
+
   retry:
     build:
       context: ../app

@@ -119,6 +119,11 @@ def _extract_upload_payload(data):
 
 
 def upload_photo(file_path: str):
+    payload, _, _ = upload_photo_timed(file_path)
+    return payload
+
+
+def upload_photo_timed(file_path: str):
     if not file_path or not os.path.isfile(file_path):
         raise FileNotFoundError(f"photo file not found: {file_path}")
 
@@ -126,17 +131,20 @@ def upload_photo(file_path: str):
     mime, _ = mimetypes.guess_type(file_path)
     content_type = mime or "application/octet-stream"
 
-    # New MAX flow: POST /uploads?type=image -> get upload URL -> upload file there.
+    init_started = time.monotonic()
     init_resp = _request_with_retry(
         "POST",
         url,
         headers=_headers_upload(),
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
+    init_finished = time.monotonic()
+    init_ms = int((init_finished - init_started) * 1000)
     init_data = init_resp.json()
 
     upload_url = init_data.get("url") if isinstance(init_data, dict) else None
     if upload_url:
+        upload_started = time.monotonic()
         with open(file_path, "rb") as fh:
             upload_resp = _request_with_retry(
                 "POST",
@@ -144,9 +152,11 @@ def upload_photo(file_path: str):
                 files={"data": (os.path.basename(file_path), fh, content_type)},
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
-        return _extract_upload_payload(upload_resp.json())
+        upload_finished = time.monotonic()
+        upload_ms = int((upload_finished - upload_started) * 1000)
+        return _extract_upload_payload(upload_resp.json()), init_ms, upload_ms
 
-    # Backward compatibility: legacy one-step upload endpoint.
+    upload_started = time.monotonic()
     with open(file_path, "rb") as fh:
         legacy_resp = _request_with_retry(
             "POST",
@@ -155,10 +165,23 @@ def upload_photo(file_path: str):
             files={"file": (os.path.basename(file_path), fh, content_type)},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-    return _extract_upload_payload(legacy_resp.json())
+    upload_finished = time.monotonic()
+    upload_ms = int((upload_finished - upload_started) * 1000)
+    return _extract_upload_payload(legacy_resp.json()), init_ms, upload_ms
 
 
 def send_message(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
+    out, _ = send_message_timed(
+        chat_id,
+        text,
+        photos=photos,
+        token=token,
+        attachment_payload=attachment_payload,
+    )
+    return out
+
+
+def send_message_timed(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
     url = f"{MAX_API_BASE}{MAX_SEND_MESSAGE_PATH}"
     params = _recipient_params(chat_id)
     body = {"text": text}
@@ -176,6 +199,7 @@ def send_message(chat_id: str, text: str, photos=None, token=None, attachment_pa
                 "payload": payload,
             }
         ]
+    send_started = time.monotonic()
     resp = _request_with_retry(
         "POST",
         url,
@@ -184,13 +208,21 @@ def send_message(chat_id: str, text: str, photos=None, token=None, attachment_pa
         json=body,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    return resp.json()
+    send_finished = time.monotonic()
+    send_ms = int((send_finished - send_started) * 1000)
+    return resp.json(), send_ms
 
 
 def send_message_with_photo(chat_id: str, text: str, file_path: str):
-    uploaded_payload = upload_photo(file_path)
-    return send_message(
+    out, _, _, _ = send_message_with_photo_timed(chat_id, text, file_path)
+    return out
+
+
+def send_message_with_photo_timed(chat_id: str, text: str, file_path: str):
+    uploaded_payload, upload_init_ms, binary_upload_ms = upload_photo_timed(file_path)
+    out, send_message_ms = send_message_timed(
         chat_id,
         text,
         attachment_payload=uploaded_payload,
     )
+    return out, upload_init_ms, binary_upload_ms, send_message_ms

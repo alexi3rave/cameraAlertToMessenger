@@ -9,7 +9,13 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import event_journal
 
-from max_client import is_configured, send_message, send_message_with_photo
+from max_client import (
+    is_configured,
+    send_message,
+    send_message_timed,
+    send_message_with_photo,
+    send_message_with_photo_timed,
+)
 from retry_policy import delay_before_next_retry, fetch_retry_policy
 
 DB_NAME = os.getenv("POSTGRES_DB", os.getenv("DB_NAME", "camera_v2"))
@@ -540,6 +546,14 @@ def main():
         row = None
         event_id = None
         trace_id = str(uuid.uuid4())
+        picked_at = None
+        event_started_at = None
+        pick_to_processing_ms = None
+        upload_init_ms = None
+        binary_upload_ms = None
+        send_message_ms = None
+        finalize_db_ms = None
+        total_event_ms = None
         try:
             row = fetch_one_ready(conn)
             if not row:
@@ -549,11 +563,15 @@ def main():
                     time.sleep(PROCESSOR_IDLE_SLEEP_SECONDS)
                 continue
 
+            picked_at = time.monotonic()
+            event_started_at = picked_at
+
             event_id = row["id"]
             recipient_id = row["recipient_id"]
             mode = delivery_mode_value()
 
             if not recipient_id:
+                finalize_started = time.monotonic()
                 set_status(
                     conn,
                     event_id,
@@ -563,6 +581,8 @@ def main():
                     "route_not_found",
                 )
                 conn.commit()
+                finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                 conn.close()
                 print(f"QUARANTINE: {event_id} route_not_found", flush=True)
                 _journal.info(
@@ -571,10 +591,14 @@ def main():
                     f"\ttrace_id={trace_id}\tattempt_no=-"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\treason=route_not_found"
+                    f"\tpick_to_processing=-\tupload_init_ms=-\tbinary_upload_ms=-"
+                    f"\tsend_message_ms=-\tfinalize_db_ms={finalize_db_ms}"
+                    f"\ttotal_event_ms={total_event_ms}"
                 )
                 continue
 
             if SHADOW_MODE == "prod" and not row.get("max_chat_id"):
+                finalize_started = time.monotonic()
                 set_status(
                     conn,
                     event_id,
@@ -584,6 +608,8 @@ def main():
                     "recipient_missing_chat_id",
                 )
                 conn.commit()
+                finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                 conn.close()
                 print(f"QUARANTINE: {event_id} recipient_missing_chat_id", flush=True)
                 _journal.info(
@@ -592,6 +618,9 @@ def main():
                     f"\ttrace_id={trace_id}\tattempt_no=-"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\treason=recipient_missing_chat_id"
+                    f"\tpick_to_processing=-\tupload_init_ms=-\tbinary_upload_ms=-"
+                    f"\tsend_message_ms=-\tfinalize_db_ms={finalize_db_ms}"
+                    f"\ttotal_event_ms={total_event_ms}"
                 )
                 continue
 
@@ -610,6 +639,7 @@ def main():
                 conn, event_id, recipient_id, mode, "pending", trace_id, None
             )
             mark_delivery_started(conn, event_id, attempt_no)
+            pick_to_processing_ms = int((time.monotonic() - picked_at) * 1000)
 
             ftp_write_time_utc = get_ftp_write_time_utc(row["full_path"])
             test_event = is_test_file(row.get("file_name"))
@@ -624,9 +654,12 @@ def main():
             )
 
             if SHADOW_MODE == "dry_run":
+                finalize_started = time.monotonic()
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
                 mark_sent(conn, event_id)
                 conn.commit()
+                finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                 conn.close()
                 print(f"SENT dry_run: {event_id}", flush=True)
                 _journal.info(
@@ -635,11 +668,15 @@ def main():
                     f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\tmode=dry_run"
+                    f"\tpick_to_processing={pick_to_processing_ms}"
+                    f"\tupload_init_ms=-\tbinary_upload_ms=-\tsend_message_ms=-"
+                    f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
                 )
                 continue
 
             if SHADOW_MODE == "shadow":
                 if not SHADOW_TEST_CHAT_ID:
+                    finalize_started = time.monotonic()
                     finish_delivery(
                         conn,
                         event_id,
@@ -655,6 +692,8 @@ def main():
                         policy,
                     )
                     conn.commit()
+                    finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                    total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                     conn.close()
                     print(
                         f"FAILED: {event_id} shadow_chat_not_configured ({out})",
@@ -666,10 +705,14 @@ def main():
                         f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                         f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                         f"\treason=shadow_chat_not_configured\toutcome={out}"
+                        f"\tpick_to_processing={pick_to_processing_ms if pick_to_processing_ms is not None else '-'}"
+                        f"\tupload_init_ms=-\tbinary_upload_ms=-\tsend_message_ms=-"
+                        f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
                     )
                     continue
 
                 if not is_configured():
+                    finalize_started = time.monotonic()
                     finish_delivery(
                         conn,
                         event_id,
@@ -685,6 +728,8 @@ def main():
                         policy,
                     )
                     conn.commit()
+                    finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                    total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                     conn.close()
                     print(
                         f"FAILED: {event_id} max_api_not_configured ({out})",
@@ -696,16 +741,28 @@ def main():
                         f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                         f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                         f"\treason=max_api_not_configured\tmode=shadow\toutcome={out}"
+                        f"\tpick_to_processing={pick_to_processing_ms if pick_to_processing_ms is not None else '-'}"
+                        f"\tupload_init_ms=-\tbinary_upload_ms=-\tsend_message_ms=-"
+                        f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
                     )
                     continue
 
                 if test_event:
-                    send_message(SHADOW_TEST_CHAT_ID, text)
+                    _, send_message_ms = send_message_timed(SHADOW_TEST_CHAT_ID, text)
                 else:
-                    send_message_with_photo(SHADOW_TEST_CHAT_ID, text, row["full_path"])
+                    _, upload_init_ms, binary_upload_ms, send_message_ms = (
+                        send_message_with_photo_timed(
+                            SHADOW_TEST_CHAT_ID,
+                            text,
+                            row["full_path"],
+                        )
+                    )
+                finalize_started = time.monotonic()
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
                 mark_sent(conn, event_id)
                 conn.commit()
+                finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                 conn.close()
                 print(f"SENT shadow: {event_id}", flush=True)
                 _journal.info(
@@ -714,11 +771,17 @@ def main():
                     f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\tmode=shadow"
+                    f"\tpick_to_processing={pick_to_processing_ms}"
+                    f"\tupload_init_ms={upload_init_ms if upload_init_ms is not None else '-'}"
+                    f"\tbinary_upload_ms={binary_upload_ms if binary_upload_ms is not None else '-'}"
+                    f"\tsend_message_ms={send_message_ms if send_message_ms is not None else '-'}"
+                    f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
                 )
                 continue
 
             if SHADOW_MODE == "prod":
                 if not is_configured():
+                    finalize_started = time.monotonic()
                     finish_delivery(
                         conn,
                         event_id,
@@ -734,6 +797,8 @@ def main():
                         policy,
                     )
                     conn.commit()
+                    finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                    total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                     conn.close()
                     print(
                         f"FAILED: {event_id} max_api_not_configured ({out})",
@@ -745,17 +810,25 @@ def main():
                         f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                         f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                         f"\treason=max_api_not_configured\tmode=prod\toutcome={out}"
+                        f"\tpick_to_processing={pick_to_processing_ms if pick_to_processing_ms is not None else '-'}"
+                        f"\tupload_init_ms=-\tbinary_upload_ms=-\tsend_message_ms=-"
+                        f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
                     )
                     continue
 
                 chat_id = row["max_chat_id"]
                 if test_event:
-                    send_message(chat_id, text)
+                    _, send_message_ms = send_message_timed(chat_id, text)
                 else:
-                    send_message_with_photo(chat_id, text, row["full_path"])
+                    _, upload_init_ms, binary_upload_ms, send_message_ms = (
+                        send_message_with_photo_timed(chat_id, text, row["full_path"])
+                    )
+                finalize_started = time.monotonic()
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
                 mark_sent(conn, event_id)
                 conn.commit()
+                finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+                total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                 conn.close()
                 print(f"SENT prod: {event_id}", flush=True)
                 _journal.info(
@@ -764,6 +837,11 @@ def main():
                     f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                     f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                     f"\tmode=prod"
+                    f"\tpick_to_processing={pick_to_processing_ms}"
+                    f"\tupload_init_ms={upload_init_ms if upload_init_ms is not None else '-'}"
+                    f"\tbinary_upload_ms={binary_upload_ms if binary_upload_ms is not None else '-'}"
+                    f"\tsend_message_ms={send_message_ms if send_message_ms is not None else '-'}"
+                    f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
                 )
                 continue
 
@@ -775,7 +853,10 @@ def main():
                 f"unsupported SHADOW_MODE={SHADOW_MODE}",
                 policy,
             )
+            finalize_started = time.monotonic()
             conn.commit()
+            finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
+            total_event_ms = int((time.monotonic() - event_started_at) * 1000)
             conn.close()
             print(f"FAILED: {event_id} unsupported_mode ({out})", flush=True)
             _journal.info(
@@ -784,6 +865,12 @@ def main():
                 f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
                 f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
                 f"\treason=unsupported_mode\toutcome={out}"
+                f"\tpick_to_processing={pick_to_processing_ms if pick_to_processing_ms is not None else '-'}"
+                f"\tupload_init_ms={upload_init_ms if upload_init_ms is not None else '-'}"
+                f"\tbinary_upload_ms={binary_upload_ms if binary_upload_ms is not None else '-'}"
+                f"\tsend_message_ms={send_message_ms if send_message_ms is not None else '-'}"
+                f"\tfinalize_db_ms={finalize_db_ms if finalize_db_ms is not None else '-'}"
+                f"\ttotal_event_ms={total_event_ms if total_event_ms is not None else '-'}"
             )
 
         except Exception as e:
@@ -793,6 +880,8 @@ def main():
             except Exception:
                 pass
             try:
+                if event_started_at is not None:
+                    total_event_ms = int((time.monotonic() - event_started_at) * 1000)
                 if event_id and row and row.get("recipient_id"):
                     c2 = db()
                     c2.autocommit = False
@@ -823,6 +912,12 @@ def main():
                         f"\tcamera={row.get('camera_code') if row else '?'}"
                         f"\tfile={row.get('file_name') if row else '?'}"
                         f"\terror={err}"
+                        f"\tpick_to_processing={pick_to_processing_ms if pick_to_processing_ms is not None else '-'}"
+                        f"\tupload_init_ms={upload_init_ms if upload_init_ms is not None else '-'}"
+                        f"\tbinary_upload_ms={binary_upload_ms if binary_upload_ms is not None else '-'}"
+                        f"\tsend_message_ms={send_message_ms if send_message_ms is not None else '-'}"
+                        f"\tfinalize_db_ms={finalize_db_ms if finalize_db_ms is not None else '-'}"
+                        f"\ttotal_event_ms={total_event_ms if total_event_ms is not None else '-'}"
                     )
                 elif event_id:
                     c2 = db()
@@ -839,6 +934,12 @@ def main():
                         f"\tcamera={row.get('camera_code') if row else '?'}"
                         f"\tfile={row.get('file_name') if row else '?'}"
                         f"\terror={err}"
+                        f"\tpick_to_processing={pick_to_processing_ms if pick_to_processing_ms is not None else '-'}"
+                        f"\tupload_init_ms={upload_init_ms if upload_init_ms is not None else '-'}"
+                        f"\tbinary_upload_ms={binary_upload_ms if binary_upload_ms is not None else '-'}"
+                        f"\tsend_message_ms={send_message_ms if send_message_ms is not None else '-'}"
+                        f"\tfinalize_db_ms={finalize_db_ms if finalize_db_ms is not None else '-'}"
+                        f"\ttotal_event_ms={total_event_ms if total_event_ms is not None else '-'}"
                     )
                 else:
                     print(f"ERROR before event picked: {e}", flush=True)
@@ -846,6 +947,8 @@ def main():
                         f"processor\tERROR"
                         f"\tevent_id=-\trecipient_id=-\ttrace_id={trace_id}\tattempt_no=-"
                         f"\tcamera=?\tfile=?\terror={err}"
+                        f"\tpick_to_processing=-\tupload_init_ms=-\tbinary_upload_ms=-"
+                        f"\tsend_message_ms=-\tfinalize_db_ms=-\ttotal_event_ms=-"
                     )
             except Exception as e2:
                 print(f"ERROR nested: {e2}", flush=True)
