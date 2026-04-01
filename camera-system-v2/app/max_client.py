@@ -1,6 +1,7 @@
 import os
 import mimetypes
 import time
+from datetime import datetime, timezone
 import requests
 
 MAX_API_BASE = os.getenv("MAX_API_BASE", "").rstrip("/")
@@ -123,7 +124,7 @@ def upload_photo(file_path: str):
     return payload
 
 
-def upload_photo_timed(file_path: str):
+def _upload_photo_timed_internal(file_path: str):
     if not file_path or not os.path.isfile(file_path):
         raise FileNotFoundError(f"photo file not found: {file_path}")
 
@@ -140,6 +141,7 @@ def upload_photo_timed(file_path: str):
     )
     init_finished = time.monotonic()
     init_ms = int((init_finished - init_started) * 1000)
+    upload_init_done_at = datetime.now(timezone.utc)
     init_data = init_resp.json()
 
     upload_url = init_data.get("url") if isinstance(init_data, dict) else None
@@ -154,7 +156,8 @@ def upload_photo_timed(file_path: str):
             )
         upload_finished = time.monotonic()
         upload_ms = int((upload_finished - upload_started) * 1000)
-        return _extract_upload_payload(upload_resp.json()), init_ms, upload_ms
+        upload_done_at = datetime.now(timezone.utc)
+        return _extract_upload_payload(upload_resp.json()), init_ms, upload_ms, upload_init_done_at, upload_done_at
 
     upload_started = time.monotonic()
     with open(file_path, "rb") as fh:
@@ -167,7 +170,17 @@ def upload_photo_timed(file_path: str):
         )
     upload_finished = time.monotonic()
     upload_ms = int((upload_finished - upload_started) * 1000)
-    return _extract_upload_payload(legacy_resp.json()), init_ms, upload_ms
+    upload_done_at = datetime.now(timezone.utc)
+    return _extract_upload_payload(legacy_resp.json()), init_ms, upload_ms, upload_init_done_at, upload_done_at
+
+
+def upload_photo_timed(file_path: str):
+    payload, init_ms, upload_ms, _, _ = _upload_photo_timed_internal(file_path)
+    return payload, init_ms, upload_ms
+
+
+def upload_photo_timed_debug(file_path: str):
+    return _upload_photo_timed_internal(file_path)
 
 
 def send_message(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
@@ -181,7 +194,7 @@ def send_message(chat_id: str, text: str, photos=None, token=None, attachment_pa
     return out
 
 
-def send_message_timed(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
+def _send_message_timed_internal(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
     url = f"{MAX_API_BASE}{MAX_SEND_MESSAGE_PATH}"
     params = _recipient_params(chat_id)
     body = {"text": text}
@@ -210,7 +223,30 @@ def send_message_timed(chat_id: str, text: str, photos=None, token=None, attachm
     )
     send_finished = time.monotonic()
     send_ms = int((send_finished - send_started) * 1000)
-    return resp.json(), send_ms
+    message_sent_at = datetime.now(timezone.utc)
+    return resp.json(), send_ms, message_sent_at
+
+
+def send_message_timed(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
+    out, send_ms, _ = _send_message_timed_internal(
+        chat_id,
+        text,
+        photos=photos,
+        token=token,
+        attachment_payload=attachment_payload,
+    )
+    return out, send_ms
+
+
+def send_message_timed_debug(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
+    out, send_ms, message_sent_at = _send_message_timed_internal(
+        chat_id,
+        text,
+        photos=photos,
+        token=token,
+        attachment_payload=attachment_payload,
+    )
+    return out, send_ms, message_sent_at
 
 
 def send_message_with_photo(chat_id: str, text: str, file_path: str):
@@ -226,3 +262,23 @@ def send_message_with_photo_timed(chat_id: str, text: str, file_path: str):
         attachment_payload=uploaded_payload,
     )
     return out, upload_init_ms, binary_upload_ms, send_message_ms
+
+
+def send_message_with_photo_timed_debug(chat_id: str, text: str, file_path: str):
+    uploaded_payload, upload_init_ms, binary_upload_ms, upload_init_done_at, upload_done_at = (
+        upload_photo_timed_debug(file_path)
+    )
+    out, send_message_ms, message_sent_at = send_message_timed_debug(
+        chat_id,
+        text,
+        attachment_payload=uploaded_payload,
+    )
+    return (
+        out,
+        upload_init_ms,
+        binary_upload_ms,
+        send_message_ms,
+        upload_init_done_at,
+        upload_done_at,
+        message_sent_at,
+    )

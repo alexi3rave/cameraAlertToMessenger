@@ -12,9 +12,8 @@ import event_journal
 from max_client import (
     is_configured,
     send_message,
-    send_message_timed,
-    send_message_with_photo,
-    send_message_with_photo_timed,
+    send_message_timed_debug,
+    upload_photo_timed_debug,
 )
 from retry_policy import delay_before_next_retry, fetch_retry_policy
 
@@ -29,6 +28,11 @@ SHADOW_TEST_CHAT_ID = os.getenv("SHADOW_TEST_CHAT_ID", "").strip()
 PIPELINE_SCHEMA_MODE = os.getenv("PIPELINE_SCHEMA_MODE", "legacy").strip().lower()
 PROCESSOR_IDLE_SLEEP_SECONDS = float(os.getenv("PROCESSOR_IDLE_SLEEP_SECONDS", "2"))
 PROCESSOR_ERROR_SLEEP_SECONDS = float(os.getenv("PROCESSOR_ERROR_SLEEP_SECONDS", "5"))
+LATENCY_DEBUG_FOLLOWUP = os.getenv("LATENCY_DEBUG_FOLLOWUP", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 _journal = event_journal.get_journal()
 EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
 WORKER_ID = os.getenv("PROCESSOR_WORKER_ID", f"processor-{socket.gethostname()}")
@@ -48,14 +52,6 @@ def db():
     )
 
 
-def get_ftp_write_time_utc(file_path):
-    try:
-        mtime = os.path.getmtime(file_path)
-        return datetime.fromtimestamp(mtime, tz=timezone.utc)
-    except OSError:
-        return None
-
-
 def _as_utc(dt):
     if dt is None:
         return None
@@ -71,22 +67,71 @@ def _fmt_moscow(dt):
     return dt.astimezone(EVENT_DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
 
 
-def build_text(camera_code, first_seen_at, ftp_write_time_utc):
+def _fmt_iso(dt):
+    dt = _as_utc(dt)
+    return dt.isoformat() if dt is not None else "-"
+
+
+def _ms_between(a, b):
+    a = _as_utc(a)
+    b = _as_utc(b)
+    if a is None or b is None:
+        return None
+    return int((a - b).total_seconds() * 1000)
+
+
+def _dur_fields(*, ftp_file_mtime, detected_at, processing_started_at, message_sent_at):
+    detect_lag_ms = _ms_between(detected_at, ftp_file_mtime)
+    queue_lag_ms = _ms_between(processing_started_at, detected_at)
+    end_to_end_ms = _ms_between(message_sent_at, ftp_file_mtime)
+    return detect_lag_ms, queue_lag_ms, end_to_end_ms
+
+
+def build_text(
+    camera_code,
+    detected_at,
+    ftp_file_mtime,
+    processing_started_at,
+    send_started_at,
+    upload_init_done_at,
+    upload_done_at,
+    message_sent_at,
+    status_committed_at,
+    *,
+    upload_init_ms=None,
+    upload_ms=None,
+    send_ms=None,
+):
     lines = ["🚨 Camera event", f"📷 Камера: {camera_code}"]
 
-    first_seen_utc = _as_utc(first_seen_at)
-    ftp_write_utc = _as_utc(ftp_write_time_utc)
-    if first_seen_utc and ftp_write_utc:
-        delta_sec = abs((first_seen_utc - ftp_write_utc).total_seconds())
-        if delta_sec <= 1:
-            lines.append(f"🕒 Время события: {_fmt_moscow(first_seen_utc)}")
-        else:
-            lines.append(f"🕒 Обнаружено системой: {_fmt_moscow(first_seen_utc)}")
-            lines.append(f"🗂 Время записи на FTP: {_fmt_moscow(ftp_write_utc)}")
-    elif first_seen_utc:
-        lines.append(f"🕒 Обнаружено системой: {_fmt_moscow(first_seen_utc)}")
-    else:
-        lines.append(f"🗂 Время записи на FTP: {_fmt_moscow(ftp_write_utc)}")
+    lines.append(f"🗂 ftp_file_mtime: {_fmt_moscow(ftp_file_mtime)}")
+    lines.append(f"🕒 detected_at: {_fmt_moscow(detected_at)}")
+
+    lines.append("⏱ latency_debug:")
+    lines.append(f"- ftp_file_mtime: {_fmt_iso(ftp_file_mtime)}")
+    lines.append(f"- detected_at: {_fmt_iso(detected_at)}")
+    lines.append(f"- processing_started_at: {_fmt_iso(processing_started_at)}")
+    lines.append(f"- send_started_at: {_fmt_iso(send_started_at)}")
+    lines.append(f"- upload_init_done_at: {_fmt_iso(upload_init_done_at)}")
+    lines.append(f"- upload_done_at: {_fmt_iso(upload_done_at)}")
+    lines.append(f"- message_sent_at: {_fmt_iso(message_sent_at)}")
+    lines.append(f"- status_committed_at: {_fmt_iso(status_committed_at)}")
+
+    detect_lag = _ms_between(detected_at, ftp_file_mtime)
+    queue_lag = _ms_between(processing_started_at, detected_at)
+    total_send_ms = None
+    if upload_init_ms is not None and upload_ms is not None and send_ms is not None:
+        total_send_ms = int(upload_init_ms) + int(upload_ms) + int(send_ms)
+    end_to_end = _ms_between(message_sent_at, ftp_file_mtime)
+
+    lines.append("⏲ durations_ms:")
+    lines.append(f"- detect_lag: {detect_lag if detect_lag is not None else '-'}")
+    lines.append(f"- queue_lag: {queue_lag if queue_lag is not None else '-'}")
+    lines.append(f"- upload_init_ms: {upload_init_ms if upload_init_ms is not None else '-'}")
+    lines.append(f"- upload_ms: {upload_ms if upload_ms is not None else '-'}")
+    lines.append(f"- send_ms: {send_ms if send_ms is not None else '-'}")
+    lines.append(f"- total_send_ms: {total_send_ms if total_send_ms is not None else '-'}")
+    lines.append(f"- end_to_end: {end_to_end if end_to_end is not None else '-'}")
 
     return "\n".join(lines)
 
@@ -123,6 +168,7 @@ def fetch_one_ready(conn):
                 e.file_name,
                 e.full_path,
                 e.first_seen_at,
+                e.ftp_written_at,
                 COALESCE(route_rec.id, r_site.id, r_tenant.id) AS recipient_id,
                 COALESCE(
                     route_rec.max_chat_id,
@@ -641,15 +687,29 @@ def main():
             mark_delivery_started(conn, event_id, attempt_no)
             pick_to_processing_ms = int((time.monotonic() - picked_at) * 1000)
 
-            ftp_write_time_utc = get_ftp_write_time_utc(row["full_path"])
             test_event = is_test_file(row.get("file_name"))
+            detected_at_utc = _as_utc(row.get("first_seen_at"))
+            ftp_file_mtime_utc = _as_utc(row.get("ftp_written_at"))
+            processing_started_at_utc = datetime.now(timezone.utc)
+
+            send_started_at_utc = None
+            upload_init_done_at_utc = None
+            upload_done_at_utc = None
+            message_sent_at_utc = None
+            status_committed_at_utc = None
             text = (
                 build_test_text(row["camera_code"], row["first_seen_at"])
                 if test_event
                 else build_text(
                     row["camera_code"],
-                    row["first_seen_at"],
-                    ftp_write_time_utc,
+                    detected_at_utc,
+                    ftp_file_mtime_utc,
+                    processing_started_at_utc,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
             )
 
@@ -671,6 +731,17 @@ def main():
                     f"\tpick_to_processing={pick_to_processing_ms}"
                     f"\tupload_init_ms=-\tbinary_upload_ms=-\tsend_message_ms=-"
                     f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
+                    f"\tftp_file_mtime={_fmt_iso(ftp_file_mtime_utc)}"
+                    f"\tdetected_at={_fmt_iso(detected_at_utc)}"
+                    f"\tprocessing_started_at={_fmt_iso(processing_started_at_utc)}"
+                    f"\tsend_started_at={_fmt_iso(send_started_at_utc)}"
+                    f"\tupload_init_done_at={_fmt_iso(upload_init_done_at_utc)}"
+                    f"\tupload_done_at={_fmt_iso(upload_done_at_utc)}"
+                    f"\tmessage_sent_at={_fmt_iso(message_sent_at_utc)}"
+                    f"\tstatus_committed_at={_fmt_iso(status_committed_at_utc)}"
+                    f"\tdetect_lag_ms={_ms_between(detected_at_utc, ftp_file_mtime_utc) if (detected_at_utc and ftp_file_mtime_utc) else '-'}"
+                    f"\tqueue_lag_ms={_ms_between(processing_started_at_utc, detected_at_utc) if (processing_started_at_utc and detected_at_utc) else '-'}"
+                    f"\tend_to_end_ms={_ms_between(message_sent_at_utc, ftp_file_mtime_utc) if (message_sent_at_utc and ftp_file_mtime_utc) else '-'}"
                 )
                 continue
 
@@ -748,14 +819,33 @@ def main():
                     continue
 
                 if test_event:
-                    _, send_message_ms = send_message_timed(SHADOW_TEST_CHAT_ID, text)
+                    send_started_at_utc = datetime.now(timezone.utc)
+                    _, send_message_ms, message_sent_at_utc = send_message_timed_debug(
+                        SHADOW_TEST_CHAT_ID, text
+                    )
                 else:
-                    _, upload_init_ms, binary_upload_ms, send_message_ms = (
-                        send_message_with_photo_timed(
-                            SHADOW_TEST_CHAT_ID,
-                            text,
-                            row["full_path"],
-                        )
+                    send_started_at_utc = datetime.now(timezone.utc)
+                    uploaded_payload, upload_init_ms, binary_upload_ms, upload_init_done_at_utc, upload_done_at_utc = (
+                        upload_photo_timed_debug(row["full_path"])
+                    )
+                    text = build_text(
+                        row["camera_code"],
+                        detected_at_utc,
+                        ftp_file_mtime_utc,
+                        processing_started_at_utc,
+                        send_started_at_utc,
+                        upload_init_done_at_utc,
+                        upload_done_at_utc,
+                        None,
+                        None,
+                        upload_init_ms=upload_init_ms,
+                        upload_ms=binary_upload_ms,
+                        send_ms=None,
+                    )
+                    _, send_message_ms, message_sent_at_utc = send_message_timed_debug(
+                        SHADOW_TEST_CHAT_ID,
+                        text,
+                        attachment_payload=uploaded_payload,
                     )
                 finalize_started = time.monotonic()
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
@@ -763,8 +853,15 @@ def main():
                 conn.commit()
                 finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
                 total_event_ms = int((time.monotonic() - event_started_at) * 1000)
+                status_committed_at_utc = datetime.now(timezone.utc)
                 conn.close()
                 print(f"SENT shadow: {event_id}", flush=True)
+                detect_lag_ms, queue_lag_ms, end_to_end_ms = _dur_fields(
+                    ftp_file_mtime=ftp_file_mtime_utc,
+                    detected_at=detected_at_utc,
+                    processing_started_at=processing_started_at_utc,
+                    message_sent_at=message_sent_at_utc,
+                )
                 _journal.info(
                     f"processor\tSENT"
                     f"\tevent_id={event_id}\trecipient_id={recipient_id}"
@@ -776,7 +873,34 @@ def main():
                     f"\tbinary_upload_ms={binary_upload_ms if binary_upload_ms is not None else '-'}"
                     f"\tsend_message_ms={send_message_ms if send_message_ms is not None else '-'}"
                     f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
+                    f"\tftp_file_mtime={_fmt_iso(ftp_file_mtime_utc)}"
+                    f"\tdetected_at={_fmt_iso(detected_at_utc)}"
+                    f"\tprocessing_started_at={_fmt_iso(processing_started_at_utc)}"
+                    f"\tsend_started_at={_fmt_iso(send_started_at_utc)}"
+                    f"\tupload_init_done_at={_fmt_iso(upload_init_done_at_utc) if not test_event else '-'}"
+                    f"\tupload_done_at={_fmt_iso(upload_done_at_utc) if not test_event else '-'}"
+                    f"\tmessage_sent_at={_fmt_iso(message_sent_at_utc)}"
+                    f"\tstatus_committed_at={_fmt_iso(status_committed_at_utc)}"
+                    f"\tdetect_lag_ms={detect_lag_ms if detect_lag_ms is not None else '-'}"
+                    f"\tqueue_lag_ms={queue_lag_ms if queue_lag_ms is not None else '-'}"
+                    f"\tend_to_end_ms={end_to_end_ms if end_to_end_ms is not None else '-'}"
                 )
+                if LATENCY_DEBUG_FOLLOWUP and not test_event:
+                    debug_text = build_text(
+                        row["camera_code"],
+                        detected_at_utc,
+                        ftp_file_mtime_utc,
+                        processing_started_at_utc,
+                        send_started_at_utc,
+                        upload_init_done_at_utc,
+                        upload_done_at_utc,
+                        message_sent_at_utc,
+                        status_committed_at_utc,
+                        upload_init_ms=upload_init_ms,
+                        upload_ms=binary_upload_ms,
+                        send_ms=send_message_ms,
+                    )
+                    send_message(SHADOW_TEST_CHAT_ID, debug_text)
                 continue
 
             if SHADOW_MODE == "prod":
@@ -818,10 +942,33 @@ def main():
 
                 chat_id = row["max_chat_id"]
                 if test_event:
-                    _, send_message_ms = send_message_timed(chat_id, text)
+                    send_started_at_utc = datetime.now(timezone.utc)
+                    _, send_message_ms, message_sent_at_utc = send_message_timed_debug(
+                        chat_id, text
+                    )
                 else:
-                    _, upload_init_ms, binary_upload_ms, send_message_ms = (
-                        send_message_with_photo_timed(chat_id, text, row["full_path"])
+                    send_started_at_utc = datetime.now(timezone.utc)
+                    uploaded_payload, upload_init_ms, binary_upload_ms, upload_init_done_at_utc, upload_done_at_utc = (
+                        upload_photo_timed_debug(row["full_path"])
+                    )
+                    text = build_text(
+                        row["camera_code"],
+                        detected_at_utc,
+                        ftp_file_mtime_utc,
+                        processing_started_at_utc,
+                        send_started_at_utc,
+                        upload_init_done_at_utc,
+                        upload_done_at_utc,
+                        None,
+                        None,
+                        upload_init_ms=upload_init_ms,
+                        upload_ms=binary_upload_ms,
+                        send_ms=None,
+                    )
+                    _, send_message_ms, message_sent_at_utc = send_message_timed_debug(
+                        chat_id,
+                        text,
+                        attachment_payload=uploaded_payload,
                     )
                 finalize_started = time.monotonic()
                 finish_delivery(conn, event_id, attempt_no, "sent", None)
@@ -829,8 +976,15 @@ def main():
                 conn.commit()
                 finalize_db_ms = int((time.monotonic() - finalize_started) * 1000)
                 total_event_ms = int((time.monotonic() - event_started_at) * 1000)
+                status_committed_at_utc = datetime.now(timezone.utc)
                 conn.close()
                 print(f"SENT prod: {event_id}", flush=True)
+                detect_lag_ms, queue_lag_ms, end_to_end_ms = _dur_fields(
+                    ftp_file_mtime=ftp_file_mtime_utc,
+                    detected_at=detected_at_utc,
+                    processing_started_at=processing_started_at_utc,
+                    message_sent_at=message_sent_at_utc,
+                )
                 _journal.info(
                     f"processor\tSENT"
                     f"\tevent_id={event_id}\trecipient_id={recipient_id}"
@@ -842,7 +996,34 @@ def main():
                     f"\tbinary_upload_ms={binary_upload_ms if binary_upload_ms is not None else '-'}"
                     f"\tsend_message_ms={send_message_ms if send_message_ms is not None else '-'}"
                     f"\tfinalize_db_ms={finalize_db_ms}\ttotal_event_ms={total_event_ms}"
+                    f"\tftp_file_mtime={_fmt_iso(ftp_file_mtime_utc)}"
+                    f"\tdetected_at={_fmt_iso(detected_at_utc)}"
+                    f"\tprocessing_started_at={_fmt_iso(processing_started_at_utc)}"
+                    f"\tsend_started_at={_fmt_iso(send_started_at_utc)}"
+                    f"\tupload_init_done_at={_fmt_iso(upload_init_done_at_utc) if not test_event else '-'}"
+                    f"\tupload_done_at={_fmt_iso(upload_done_at_utc) if not test_event else '-'}"
+                    f"\tmessage_sent_at={_fmt_iso(message_sent_at_utc)}"
+                    f"\tstatus_committed_at={_fmt_iso(status_committed_at_utc)}"
+                    f"\tdetect_lag_ms={detect_lag_ms if detect_lag_ms is not None else '-'}"
+                    f"\tqueue_lag_ms={queue_lag_ms if queue_lag_ms is not None else '-'}"
+                    f"\tend_to_end_ms={end_to_end_ms if end_to_end_ms is not None else '-'}"
                 )
+                if LATENCY_DEBUG_FOLLOWUP and not test_event:
+                    debug_text = build_text(
+                        row["camera_code"],
+                        detected_at_utc,
+                        ftp_file_mtime_utc,
+                        processing_started_at_utc,
+                        send_started_at_utc,
+                        upload_init_done_at_utc,
+                        upload_done_at_utc,
+                        message_sent_at_utc,
+                        status_committed_at_utc,
+                        upload_init_ms=upload_init_ms,
+                        upload_ms=binary_upload_ms,
+                        send_ms=send_message_ms,
+                    )
+                    send_message(chat_id, debug_text)
                 continue
 
             finish_delivery(conn, event_id, attempt_no, "failed", "unsupported_mode")

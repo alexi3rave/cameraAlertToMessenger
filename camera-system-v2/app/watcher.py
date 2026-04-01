@@ -2,6 +2,7 @@ import os
 import re
 import time
 import hashlib
+from datetime import datetime, timezone
 import psycopg2
 import event_journal
 
@@ -25,6 +26,7 @@ WATCH_USE_MTIME_CURSOR = (
     os.environ.get("WATCH_USE_MTIME_CURSOR", "1").strip().lower() in ("1", "true", "yes")
 )
 PIPELINE_SCHEMA_MODE = os.environ.get("PIPELINE_SCHEMA_MODE", "legacy").strip().lower()
+WATCH_CHECKSUM_MODE = os.environ.get("WATCH_CHECKSUM_MODE", "sha256").strip().lower()
 
 DB_NAME = os.environ["POSTGRES_DB"]
 DB_USER = os.environ["POSTGRES_USER"]
@@ -75,6 +77,13 @@ def extract_site_from_path(full_path):
 def make_event_key(camera_code, file_name, size, checksum):
 
     raw=f"{camera_code}|{file_name}|{size}|{checksum}"
+
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def make_event_key_no_checksum(camera_code, file_name, size, mtime_seconds):
+
+    raw = f"{camera_code}|{file_name}|{size}|{int(mtime_seconds)}"
 
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -134,18 +143,20 @@ cam_final AS (
 )
 INSERT INTO events(
     id, event_key, file_name, full_path, file_size,
-    status, camera_code, camera_id, checksum_sha256, quarantine_reason
+    status, camera_code, camera_id, checksum_sha256, quarantine_reason,
+    ftp_written_at,
+    first_seen_at
 )
 SELECT
     uuid_generate_v4(), %s, %s, %s, %s, %s, %s,
-    (SELECT id FROM cam_final), %s, %s
+    (SELECT id FROM cam_final), %s, %s, %s, %s
 WHERE NOT EXISTS (
     SELECT 1
     FROM events
     WHERE camera_id = (SELECT id FROM cam_final)
       AND file_name = %s
       AND file_size = %s
-      AND checksum_sha256 = %s
+      AND checksum_sha256 IS NOT DISTINCT FROM %s
 )
 ON CONFLICT(event_key) DO NOTHING
 """
@@ -179,8 +190,6 @@ while True:
                 except OSError:
                     continue
 
-                too_old = (loop_started_at - mtime1) > MAX_FILE_AGE_SECONDS
-
                 # ── fast in-memory dedup (no I/O, no DB round-trip) ──
                 camera_code = detect_camera_code(f)
                 name_key = (camera_code, f)
@@ -199,14 +208,24 @@ while True:
                 if size1 != size2 or mtime1 != mtime2:
                     continue
 
+                ftp_written_at_utc = datetime.fromtimestamp(mtime2, tz=timezone.utc)
+                too_old = (loop_started_at - mtime2) > MAX_FILE_AGE_SECONDS
+
+                detected_at_utc = datetime.now(timezone.utc)
+
                 site_code = extract_site_from_path(path)
 
-                try:
-                    checksum = file_sha256(path)
-                except OSError:
-                    continue
+                checksum = None
+                if WATCH_CHECKSUM_MODE != "skip":
+                    try:
+                        checksum = file_sha256(path)
+                    except OSError:
+                        continue
 
-                event_key = make_event_key(camera_code, f, size2, checksum)
+                if checksum is None:
+                    event_key = make_event_key_no_checksum(camera_code, f, size2, mtime2)
+                else:
+                    event_key = make_event_key(camera_code, f, size2, checksum)
                 if event_key in seen_keys:
                     continue
 
@@ -222,7 +241,7 @@ while True:
                                 camera_code, camera_code, camera_code,
                                 camera_code,
                                 event_key, f, path, size2, status, camera_code,
-                                checksum, quarantine_reason,
+                                checksum, quarantine_reason, ftp_written_at_utc, detected_at_utc,
                                 f, size2, checksum,
                             ))
 
@@ -260,7 +279,7 @@ while True:
                                   file_size, checksum_sha256, status, attempt_count,
                                   next_retry_at, last_attempt_at, quarantine_reason,
                                   last_error, provider_message_ref, sent_at,
-                                  delivered_at, ftp_removed_at, first_seen_at, updated_at
+                                  delivered_at, ftp_removed_at, ftp_written_at, first_seen_at, updated_at
                                 )
                                 SELECT
                                   e.id, e.event_key, ps.id, e.file_name, e.full_path,
@@ -268,7 +287,7 @@ while True:
                                   COALESCE(e.attempt_count, 0), e.next_retry_at,
                                   e.last_attempt_at, e.quarantine_reason, e.last_error,
                                   e.provider_message_ref, e.sent_at,
-                                  NULL::timestamptz, NULL::timestamptz,
+                                  NULL::timestamptz, NULL::timestamptz, e.ftp_written_at,
                                   COALESCE(e.first_seen_at, now()), now()
                                 FROM events e
                                 JOIN photo_sources ps
@@ -291,6 +310,7 @@ while True:
                         f"\tcamera={camera_code}\tfile={f}"
                         f"\tsite={site_code}\tpath={path}"
                         f"\tstatus={status}\treason={quarantine_reason or '-'}"
+                        f"\tftp_file_mtime={ftp_written_at_utc.isoformat()}"
                         f"\tkey={event_key}"
                     )
 
