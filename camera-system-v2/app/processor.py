@@ -41,6 +41,12 @@ PROCESSOR_PREFLIGHT_ENABLED = os.getenv("PROCESSOR_PREFLIGHT_ENABLED", "1").stri
 PROCESSOR_PREFLIGHT_MIN_SIZE_BYTES = int(
     os.getenv("PROCESSOR_PREFLIGHT_MIN_SIZE_BYTES", "1024")
 )
+PROCESSOR_PREFLIGHT_STABILIZE_SECONDS = float(
+    os.getenv("PROCESSOR_PREFLIGHT_STABILIZE_SECONDS", "0.2")
+)
+PROCESSOR_PREFLIGHT_DECODE_VERIFY = os.getenv(
+    "PROCESSOR_PREFLIGHT_DECODE_VERIFY", "0"
+).strip().lower() in ("1", "true", "yes")
 _journal = event_journal.get_journal()
 EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
 WORKER_ID = os.getenv("PROCESSOR_WORKER_ID", f"processor-{socket.gethostname()}")
@@ -114,32 +120,10 @@ def build_text(
 
     lines.append(f"🗂 ftp_file_mtime: {_fmt_moscow(ftp_file_mtime)}")
     lines.append(f"🕒 detected_at: {_fmt_moscow(detected_at)}")
-
-    lines.append("⏱ latency_debug:")
-    lines.append(f"- ftp_file_mtime: {_fmt_iso(ftp_file_mtime)}")
-    lines.append(f"- detected_at: {_fmt_iso(detected_at)}")
-    lines.append(f"- processing_started_at: {_fmt_iso(processing_started_at)}")
-    lines.append(f"- send_started_at: {_fmt_iso(send_started_at)}")
-    lines.append(f"- upload_init_done_at: {_fmt_iso(upload_init_done_at)}")
-    lines.append(f"- upload_done_at: {_fmt_iso(upload_done_at)}")
-    lines.append(f"- message_sent_at: {_fmt_iso(message_sent_at)}")
-    lines.append(f"- status_committed_at: {_fmt_iso(status_committed_at)}")
-
-    detect_lag = _ms_between(detected_at, ftp_file_mtime)
-    queue_lag = _ms_between(processing_started_at, detected_at)
-    total_send_ms = None
-    if upload_init_ms is not None and upload_ms is not None and send_ms is not None:
-        total_send_ms = int(upload_init_ms) + int(upload_ms) + int(send_ms)
-    end_to_end = _ms_between(message_sent_at, ftp_file_mtime)
-
-    lines.append("⏲ durations_ms:")
-    lines.append(f"- detect_lag: {detect_lag if detect_lag is not None else '-'}")
-    lines.append(f"- queue_lag: {queue_lag if queue_lag is not None else '-'}")
-    lines.append(f"- upload_init_ms: {upload_init_ms if upload_init_ms is not None else '-'}")
-    lines.append(f"- upload_ms: {upload_ms if upload_ms is not None else '-'}")
-    lines.append(f"- send_ms: {send_ms if send_ms is not None else '-'}")
-    lines.append(f"- total_send_ms: {total_send_ms if total_send_ms is not None else '-'}")
-    lines.append(f"- end_to_end: {end_to_end if end_to_end is not None else '-'}")
+    if message_sent_at is not None:
+        end_to_end = _ms_between(message_sent_at, ftp_file_mtime)
+        lines.append(f"✅ message_sent_at: {_fmt_moscow(message_sent_at)}")
+        lines.append(f"⏲ end_to_end_ms: {end_to_end if end_to_end is not None else '-'}")
 
     return "\n".join(lines)
 
@@ -160,6 +144,19 @@ def _preflight_file_ok(*, full_path: str, file_name: str, file_size_db):
     size_now = os.path.getsize(full_path)
     if size_now < PROCESSOR_PREFLIGHT_MIN_SIZE_BYTES:
         return False, f"file_too_small:{size_now}", {"size_now": size_now, "size_db": file_size_db}
+
+    if file_size_db is None or int(file_size_db) <= 0:
+        if PROCESSOR_PREFLIGHT_STABILIZE_SECONDS > 0:
+            size1 = size_now
+            time.sleep(PROCESSOR_PREFLIGHT_STABILIZE_SECONDS)
+            size2 = os.path.getsize(full_path)
+            if size2 != size1:
+                return (
+                    False,
+                    f"file_still_growing:{size1}->{size2}",
+                    {"size_now": size2, "size_db": file_size_db},
+                )
+            size_now = size2
 
     if file_size_db is not None and int(file_size_db) > 0 and size_now != int(file_size_db):
         return (
@@ -186,6 +183,21 @@ def _preflight_file_ok(*, full_path: str, file_name: str, file_size_db):
                 },
             )
 
+        if PROCESSOR_PREFLIGHT_DECODE_VERIFY:
+            try:
+                from PIL import Image
+
+                with Image.open(full_path) as img:
+                    img.verify()
+                with Image.open(full_path) as img:
+                    img.load()
+            except Exception as e:
+                return (
+                    False,
+                    "jpeg_decode_verify_failed",
+                    {"size_now": size2, "error": str(e)[:200]},
+                )
+
     if ext == ".png":
         size2, head, tail = _read_head_tail(full_path, 8)
         sig_ok = head == b"\x89PNG\r\n\x1a\n"
@@ -195,6 +207,21 @@ def _preflight_file_ok(*, full_path: str, file_name: str, file_size_db):
                 "png_bad_signature",
                 {"size_now": size2, "head_hex": head.hex()},
             )
+
+        if PROCESSOR_PREFLIGHT_DECODE_VERIFY:
+            try:
+                from PIL import Image
+
+                with Image.open(full_path) as img:
+                    img.verify()
+                with Image.open(full_path) as img:
+                    img.load()
+            except Exception as e:
+                return (
+                    False,
+                    "png_decode_verify_failed",
+                    {"size_now": size2, "error": str(e)[:200]},
+                )
 
     return True, None, {"size_now": size_now, "size_db": file_size_db}
 

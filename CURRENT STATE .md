@@ -1,6 +1,6 @@
 CURRENT STATE
 
-обновлено: 2026-03-30
+обновлено: 2026-04-03
 
 ---
 
@@ -19,13 +19,14 @@ Stage 3 — ЗАКРЫТ
 camera-v2-postgres
 camera-v2-watcher
 camera-v2-processor
+camera-v2-processor2
 camera-v2-retry
 camera-v2-ftp-cleanup
 camera-ftp
 camera-n8n
 
 repo на сервере: /opt/cursor-agent/camera-system-v2
-ветка: feat/watcher-perf-dedup-test-events
+ветка: master
 
 ---
 
@@ -42,7 +43,8 @@ ftp_cleanup_worker: TTL = 7 дней + отдельный quarantine TTL (FTP_QU
 auto onboarding: новая камера и site создаются автоматически
 SHADOW_MODE: dry_run / shadow / prod
 статус contracts зафиксированы (см. DB model.md)
-single env файл: env/app.env
+базовая конфигурация: env/app.env + overrides через env в docker-compose.yml (для watcher/processor)
+
 restart контейнеров не ломает pipeline
 n8n контур не затронут
 
@@ -56,11 +58,31 @@ persistent DB connection (reconnect on failure)
 быстрые дефолты: stabilize=0.2s, loop=1s
 latency: ~3 минуты → <1 секунды (FTP → MAX)
 
-### processor (обновлен 2026-03-29)
+дополнительно (2026-04-03):
+минимальный размер файла перед вставкой в events: WATCH_MIN_FILE_SIZE_BYTES (default: 1024)
+в журнал DISCOVERED добавлено поле file_size
 
-test file support: TEST_FILE_REGEX (default: \.txt$)
+### processor (обновлен 2026-04-03)
+
+test file support: TEST_FILE_REGEX (default: (^test_|_test_|healthcheck|probe))
 text-only уведомление для тестовых файлов: «✅ Test event received»
 фото загружается только для реальных событий
+
+дополнительно (2026-04-03):
+preflight перед загрузкой фото в MAX (для защиты от обрезанных/недописанных файлов):
+PROCESSOR_PREFLIGHT_ENABLED (default: 1)
+PROCESSOR_PREFLIGHT_MIN_SIZE_BYTES (default: 1024)
+PROCESSOR_PREFLIGHT_STABILIZE_SECONDS (default: 0.2)
+JPEG: проверка SOI/EOI; PNG: проверка сигнатуры
+опционально: PROCESSOR_PREFLIGHT_DECODE_VERIFY=1 (Pillow Image.verify/load)
+при провале preflight событие уходит в failed_retryable (через retry policy), фото не отправляется
+
+debug MAX API (через env в compose):
+MAX_DEBUG_LOG=1
+MAX_DEBUG_LOG_BODY_LIMIT (default: 512)
+
+latency follow-up (LATENCY_DEBUG_FOLLOWUP=1):
+в MAX отправляется короткое сообщение только с message_sent_at и end_to_end_ms
 
 ### журнал событий (добавлен 2026-03-30)
 
