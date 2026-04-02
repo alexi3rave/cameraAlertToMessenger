@@ -33,6 +33,14 @@ LATENCY_DEBUG_FOLLOWUP = os.getenv("LATENCY_DEBUG_FOLLOWUP", "0").strip().lower(
     "true",
     "yes",
 )
+PROCESSOR_PREFLIGHT_ENABLED = os.getenv("PROCESSOR_PREFLIGHT_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+PROCESSOR_PREFLIGHT_MIN_SIZE_BYTES = int(
+    os.getenv("PROCESSOR_PREFLIGHT_MIN_SIZE_BYTES", "1024")
+)
 _journal = event_journal.get_journal()
 EVENT_DISPLAY_TZ = ZoneInfo("Europe/Moscow")
 WORKER_ID = os.getenv("PROCESSOR_WORKER_ID", f"processor-{socket.gethostname()}")
@@ -136,6 +144,61 @@ def build_text(
     return "\n".join(lines)
 
 
+def _read_head_tail(path: str, tail_len: int = 2):
+    st = os.stat(path)
+    with open(path, "rb") as f:
+        head = f.read(tail_len)
+        f.seek(max(0, st.st_size - tail_len))
+        tail = f.read(tail_len)
+    return st.st_size, head, tail
+
+
+def _preflight_file_ok(*, full_path: str, file_name: str, file_size_db):
+    if not full_path or not os.path.exists(full_path):
+        return False, "file_missing", None
+
+    size_now = os.path.getsize(full_path)
+    if size_now < PROCESSOR_PREFLIGHT_MIN_SIZE_BYTES:
+        return False, f"file_too_small:{size_now}", {"size_now": size_now, "size_db": file_size_db}
+
+    if file_size_db is not None and int(file_size_db) > 0 and size_now != int(file_size_db):
+        return (
+            False,
+            f"file_size_mismatch:{size_now}!={int(file_size_db)}",
+            {"size_now": size_now, "size_db": int(file_size_db)},
+        )
+
+    ext = os.path.splitext(file_name or "")[1].lower()
+    if ext in (".jpg", ".jpeg"):
+        size2, head, tail = _read_head_tail(full_path, 2)
+        soi = head == b"\xff\xd8"
+        eoi = tail == b"\xff\xd9"
+        if not (soi and eoi):
+            return (
+                False,
+                "jpeg_incomplete",
+                {
+                    "size_now": size2,
+                    "soi": soi,
+                    "eoi": eoi,
+                    "head_hex": head.hex(),
+                    "tail_hex": tail.hex(),
+                },
+            )
+
+    if ext == ".png":
+        size2, head, tail = _read_head_tail(full_path, 8)
+        sig_ok = head == b"\x89PNG\r\n\x1a\n"
+        if not sig_ok:
+            return (
+                False,
+                "png_bad_signature",
+                {"size_now": size2, "head_hex": head.hex()},
+            )
+
+    return True, None, {"size_now": size_now, "size_db": file_size_db}
+
+
 def is_test_file(file_name):
     return bool(file_name and TEST_FILE_REGEX.search(file_name))
 
@@ -167,6 +230,7 @@ def fetch_one_ready(conn):
                 e.camera_code,
                 e.file_name,
                 e.full_path,
+                e.file_size,
                 e.first_seen_at,
                 e.ftp_written_at,
                 COALESCE(route_rec.id, r_site.id, r_tenant.id) AS recipient_id,
@@ -824,6 +888,33 @@ def main():
                         SHADOW_TEST_CHAT_ID, text
                     )
                 else:
+                    if PROCESSOR_PREFLIGHT_ENABLED:
+                        ok, reason, details = _preflight_file_ok(
+                            full_path=row.get("full_path"),
+                            file_name=row.get("file_name"),
+                            file_size_db=row.get("file_size"),
+                        )
+                        if not ok:
+                            err = f"preflight:{reason}"
+                            finish_delivery(conn, event_id, attempt_no, "failed", err)
+                            out = apply_delivery_failure(
+                                conn,
+                                event_id,
+                                recipient_id,
+                                err,
+                                policy,
+                            )
+                            conn.commit()
+                            conn.close()
+                            _journal.error(
+                                f"processor\tFAILED"
+                                f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                                f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
+                                f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                                f"\treason=preflight\toutcome={out}"
+                                f"\tdetails={str(details)[:400] if details is not None else '-'}"
+                            )
+                            continue
                     send_started_at_utc = datetime.now(timezone.utc)
                     uploaded_payload, upload_init_ms, binary_upload_ms, upload_init_done_at_utc, upload_done_at_utc = (
                         upload_photo_timed_debug(row["full_path"])
@@ -947,6 +1038,33 @@ def main():
                         chat_id, text
                     )
                 else:
+                    if PROCESSOR_PREFLIGHT_ENABLED:
+                        ok, reason, details = _preflight_file_ok(
+                            full_path=row.get("full_path"),
+                            file_name=row.get("file_name"),
+                            file_size_db=row.get("file_size"),
+                        )
+                        if not ok:
+                            err = f"preflight:{reason}"
+                            finish_delivery(conn, event_id, attempt_no, "failed", err)
+                            out = apply_delivery_failure(
+                                conn,
+                                event_id,
+                                recipient_id,
+                                err,
+                                policy,
+                            )
+                            conn.commit()
+                            conn.close()
+                            _journal.error(
+                                f"processor\tFAILED"
+                                f"\tevent_id={event_id}\trecipient_id={recipient_id}"
+                                f"\ttrace_id={trace_id}\tattempt_no={attempt_no}"
+                                f"\tcamera={row.get('camera_code')}\tfile={row.get('file_name')}"
+                                f"\treason=preflight\toutcome={out}"
+                                f"\tdetails={str(details)[:400] if details is not None else '-'}"
+                            )
+                            continue
                     send_started_at_utc = datetime.now(timezone.utc)
                     uploaded_payload, upload_init_ms, binary_upload_ms, upload_init_done_at_utc, upload_done_at_utc = (
                         upload_photo_timed_debug(row["full_path"])

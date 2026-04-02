@@ -22,6 +22,7 @@ WATCH_INITIAL_LOOKBACK_SECONDS = float(
     os.environ.get("WATCH_INITIAL_LOOKBACK_SECONDS", "120")
 )
 WATCH_MTIME_GUARD_SECONDS = float(os.environ.get("WATCH_MTIME_GUARD_SECONDS", "2"))
+WATCH_MIN_FILE_SIZE_BYTES = int(os.environ.get("WATCH_MIN_FILE_SIZE_BYTES", "1"))
 WATCH_USE_MTIME_CURSOR = (
     os.environ.get("WATCH_USE_MTIME_CURSOR", "1").strip().lower() in ("1", "true", "yes")
 )
@@ -208,6 +209,9 @@ while True:
                 if size1 != size2 or mtime1 != mtime2:
                     continue
 
+                if size2 < WATCH_MIN_FILE_SIZE_BYTES:
+                    continue
+
                 ftp_written_at_utc = datetime.fromtimestamp(mtime2, tz=timezone.utc)
                 too_old = (loop_started_at - mtime2) > MAX_FILE_AGE_SECONDS
 
@@ -311,6 +315,7 @@ while True:
                         f"\tsite={site_code}\tpath={path}"
                         f"\tstatus={status}\treason={quarantine_reason or '-'}"
                         f"\tftp_file_mtime={ftp_written_at_utc.isoformat()}"
+                        f"\tfile_size={size2}"
                         f"\tkey={event_key}"
                     )
 
