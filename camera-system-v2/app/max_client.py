@@ -1,8 +1,10 @@
 import os
 import mimetypes
 import time
+import json
 from datetime import datetime, timezone
 import requests
+import event_journal
 
 MAX_API_BASE = os.getenv("MAX_API_BASE", "").rstrip("/")
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
@@ -12,6 +14,9 @@ REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
 MAX_RETRY_BASE_DELAY_SECONDS = float(os.getenv("MAX_RETRY_BASE_DELAY_SECONDS", "1"))
 MAX_RETRY_MAX_DELAY_SECONDS = float(os.getenv("MAX_RETRY_MAX_DELAY_SECONDS", "8"))
+MAX_DEBUG_LOG = os.getenv("MAX_DEBUG_LOG", "0").strip().lower() in ("1", "true", "yes")
+MAX_DEBUG_LOG_BODY_LIMIT = int(os.getenv("MAX_DEBUG_LOG_BODY_LIMIT", "800"))
+_journal = event_journal.get_journal()
 
 # Документация MAX: https://dev.max.ru/docs-api/methods/POST/messages
 # Authorization: токен целиком, без префикса "Bearer " (если нужен Bearer — MAX_AUTH_HEADER_STYLE=bearer)
@@ -43,6 +48,55 @@ def _headers_upload():
     return {"Authorization": _auth_value()}
 
 
+def _scrub(value):
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            lk = str(k).lower()
+            if lk in ("authorization", "token", "url", "upload_url"):
+                out[k] = "***"
+                continue
+            if lk == "photos" and isinstance(v, dict):
+                out[k] = {str(pk): "***" for pk in v.keys()}
+                continue
+            out[k] = _scrub(v)
+        return out
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    return value
+
+
+def _debug_log(event: str, **fields):
+    if not MAX_DEBUG_LOG:
+        return
+    safe = _scrub(fields)
+    try:
+        payload = json.dumps(safe, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        payload = str(safe)
+    _journal.info(f"max\tDEBUG\tevent={event}\tdata={payload}")
+
+
+def _resp_snippet(resp):
+    if resp is None:
+        return None
+    ct = resp.headers.get("Content-Type", "") if hasattr(resp, "headers") else ""
+    try:
+        if "application/json" in ct:
+            return _scrub(resp.json())
+    except Exception:
+        pass
+    try:
+        t = resp.text
+    except Exception:
+        return None
+    if t is None:
+        return None
+    if len(t) > MAX_DEBUG_LOG_BODY_LIMIT:
+        return t[:MAX_DEBUG_LOG_BODY_LIMIT] + "..."
+    return t
+
+
 def _is_retryable_status(status_code: int) -> bool:
     return status_code in (429, 500, 502, 503, 504)
 
@@ -71,20 +125,59 @@ def _backoff_seconds(attempt_no: int, resp=None) -> float:
 def _request_with_retry(method: str, url: str, **kwargs):
     attempts = max(0, MAX_RETRY_ATTEMPTS)
     for attempt in range(0, attempts + 1):
+        started = time.monotonic()
         try:
             resp = requests.request(method, url, **kwargs)
         except requests.RequestException:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            _debug_log(
+                "request_exception",
+                method=method,
+                url=url,
+                attempt=attempt,
+                attempts=attempts,
+                elapsed_ms=elapsed_ms,
+            )
             if attempt >= attempts:
                 raise
             time.sleep(_backoff_seconds(attempt + 1))
             continue
 
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _debug_log(
+            "response",
+            method=method,
+            url=url,
+            attempt=attempt,
+            attempts=attempts,
+            status_code=resp.status_code,
+            elapsed_ms=elapsed_ms,
+            retry_after=resp.headers.get("Retry-After") if hasattr(resp, "headers") else None,
+            body=_resp_snippet(resp),
+        )
+
         if _is_retryable_status(resp.status_code):
             if attempt >= attempts:
+                _debug_log(
+                    "retryable_exhausted",
+                    method=method,
+                    url=url,
+                    status_code=resp.status_code,
+                    attempt=attempt,
+                    attempts=attempts,
+                )
                 resp.raise_for_status()
             time.sleep(_backoff_seconds(attempt + 1, resp))
             continue
 
+        if resp.status_code >= 400:
+            _debug_log(
+                "http_error",
+                method=method,
+                url=url,
+                status_code=resp.status_code,
+                body=_resp_snippet(resp),
+            )
         resp.raise_for_status()
         return resp
 
@@ -143,6 +236,12 @@ def _upload_photo_timed_internal(file_path: str):
     init_ms = int((init_finished - init_started) * 1000)
     upload_init_done_at = datetime.now(timezone.utc)
     init_data = init_resp.json()
+    _debug_log(
+        "upload_init_json",
+        file=os.path.basename(file_path),
+        init_ms=init_ms,
+        init_data=init_data,
+    )
 
     upload_url = init_data.get("url") if isinstance(init_data, dict) else None
     if upload_url:
@@ -157,7 +256,14 @@ def _upload_photo_timed_internal(file_path: str):
         upload_finished = time.monotonic()
         upload_ms = int((upload_finished - upload_started) * 1000)
         upload_done_at = datetime.now(timezone.utc)
-        return _extract_upload_payload(upload_resp.json()), init_ms, upload_ms, upload_init_done_at, upload_done_at
+        upload_json = upload_resp.json()
+        _debug_log(
+            "upload_binary_json",
+            file=os.path.basename(file_path),
+            upload_ms=upload_ms,
+            upload_data=upload_json,
+        )
+        return _extract_upload_payload(upload_json), init_ms, upload_ms, upload_init_done_at, upload_done_at
 
     upload_started = time.monotonic()
     with open(file_path, "rb") as fh:
@@ -171,7 +277,14 @@ def _upload_photo_timed_internal(file_path: str):
     upload_finished = time.monotonic()
     upload_ms = int((upload_finished - upload_started) * 1000)
     upload_done_at = datetime.now(timezone.utc)
-    return _extract_upload_payload(legacy_resp.json()), init_ms, upload_ms, upload_init_done_at, upload_done_at
+    legacy_json = legacy_resp.json()
+    _debug_log(
+        "upload_legacy_json",
+        file=os.path.basename(file_path),
+        upload_ms=upload_ms,
+        upload_data=legacy_json,
+    )
+    return _extract_upload_payload(legacy_json), init_ms, upload_ms, upload_init_done_at, upload_done_at
 
 
 def upload_photo_timed(file_path: str):
@@ -224,7 +337,14 @@ def _send_message_timed_internal(chat_id: str, text: str, photos=None, token=Non
     send_finished = time.monotonic()
     send_ms = int((send_finished - send_started) * 1000)
     message_sent_at = datetime.now(timezone.utc)
-    return resp.json(), send_ms, message_sent_at
+    out = resp.json()
+    _debug_log(
+        "send_message_json",
+        chat_id=str(chat_id) if chat_id is not None else None,
+        send_ms=send_ms,
+        out=out,
+    )
+    return out, send_ms, message_sent_at
 
 
 def send_message_timed(chat_id: str, text: str, photos=None, token=None, attachment_payload=None):
