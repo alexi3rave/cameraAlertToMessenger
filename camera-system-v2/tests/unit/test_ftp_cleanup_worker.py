@@ -10,7 +10,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../app"))
 
 import unittest
-from unittest.mock import Mock, patch, MagicMock, call
+from unittest.mock import Mock, patch
 import time
 import stat
 
@@ -94,7 +94,6 @@ class TestCleanupEligibility(unittest.TestCase):
     def test_ready_status_not_deleted(self):
         """P0-1: ready файл старше retention НЕ удаляется (не терминальный статус)"""
         # Arrange: ready событие старше retention
-        old_timestamp = time.time() - 10 * 86400  # 10 days ago
         row = self._make_row(status="ready", full_path="/source/cam01/test.jpg")
         
         # Проверка: ready не в TERMINAL
@@ -196,7 +195,6 @@ class TestEligibleQuarantineFile(unittest.TestCase):
 
     def test_quarantine_file_older_than_retention_deleted(self):
         """quarantine файл старше FTP_QUARANTINE_RETENTION_DAYS удаляется"""
-        retention_days = 7
         quarantine_retention = 3
         cutoff = time.time() - quarantine_retention * 86400
         old_mtime = cutoff - 3600
@@ -255,10 +253,8 @@ class TestRetentionBoundaries(unittest.TestCase):
         cutoff = time.time() - retention_days * 86400
         
         # mtime == cutoff (граница)
-        row = (1, os.sep + os.path.join("source", "cam01", "boundary.jpg"), "boundary.jpg", "cam01", "2024-01-01 10:00:00", "sent")
-        
         with patch("os.stat", return_value=FakeStat(cutoff)), \
-             patch("os.remove") as mock_remove, \
+             patch("os.remove"), \
              patch("ftp_cleanup_worker.path_is_under_root", return_value=True):
             
             # В текущей логике: st.st_mtime > cutoff пропускает
@@ -395,7 +391,7 @@ class TestDeleteVsSkipDecision(unittest.TestCase):
         """Эмулирует ветку FileNotFoundError из main()"""
         full_path = row[1]
         try:
-            st = os.stat(full_path)
+            os.stat(full_path)
         except FileNotFoundError:
             # В реальном коде здесь UPDATE ftp_removed_at
             return {"action": "mark_removed", "event_id": row[0]}
@@ -420,7 +416,7 @@ class TestDeleteVsSkipDecision(unittest.TestCase):
         """Эмулирует обработку ошибки stat"""
         full_path = row[1]
         try:
-            st = os.stat(full_path)
+            os.stat(full_path)
         except FileNotFoundError:
             return {"action": "mark_removed"}
         except OSError:
@@ -441,7 +437,7 @@ class TestPathGuardrailsIntegration(unittest.TestCase):
         
         with patch("os.stat", return_value=FakeStat(old_mtime)), \
              patch("os.remove") as mock_remove, \
-             patch("ftp_cleanup_worker.path_is_under_root", return_value=False) as mock_guard:
+             patch("ftp_cleanup_worker.path_is_under_root", return_value=False):
             
             # Проверка guardrails
             is_allowed = worker.path_is_under_root(row[1], os.sep + "source")
