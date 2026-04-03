@@ -165,185 +165,195 @@ ON CONFLICT(event_key) DO NOTHING
 conn = None
 
 
-while True:
+def main(*, max_loops=None):
+    global scan_from_ts
 
-    try:
-        if conn is None or conn.closed:
-            conn = make_conn()
+    conn = None
+    loops_done = 0
+    while True:
 
-        loop_started_at = time.time()
+        try:
+            if conn is None or conn.closed:
+                conn = make_conn()
 
-        for root, _, files in os.walk(WATCH_PATH):
+            loop_started_at = time.time()
 
-            for f in files:
+            for root, _, files in os.walk(WATCH_PATH):
 
-                path = os.path.join(root, f)
-                ext = os.path.splitext(f)[1].lower()
-                test_file = is_test_file(f)
+                for f in files:
 
-                if ext not in ALLOWED_EXTENSIONS:
-                    if not (test_file and ext in TEST_FILE_ALLOWED_EXTENSIONS):
-                        continue
+                    path = os.path.join(root, f)
+                    ext = os.path.splitext(f)[1].lower()
+                    test_file = is_test_file(f)
 
-                try:
-                    size1 = os.path.getsize(path)
-                    mtime1 = os.path.getmtime(path)
-                except OSError:
-                    continue
+                    if ext not in ALLOWED_EXTENSIONS:
+                        if not (test_file and ext in TEST_FILE_ALLOWED_EXTENSIONS):
+                            continue
 
-                # ── fast in-memory dedup (no I/O, no DB round-trip) ──
-                camera_code = detect_camera_code(f)
-                name_key = (camera_code, f)
-                if name_key in seen_names:
-                    continue
-                # stabilisation: verify file stopped changing
-                if FILE_STABILIZE_SECONDS > 0:
-                    time.sleep(FILE_STABILIZE_SECONDS)
-
-                try:
-                    size2 = os.path.getsize(path)
-                    mtime2 = os.path.getmtime(path)
-                except OSError:
-                    continue
-
-                if size1 != size2 or mtime1 != mtime2:
-                    continue
-
-                if size2 < WATCH_MIN_FILE_SIZE_BYTES:
-                    continue
-
-                ftp_written_at_utc = datetime.fromtimestamp(mtime2, tz=timezone.utc)
-                too_old = (loop_started_at - mtime2) > MAX_FILE_AGE_SECONDS
-
-                detected_at_utc = datetime.now(timezone.utc)
-
-                site_code = extract_site_from_path(path)
-
-                checksum = None
-                if WATCH_CHECKSUM_MODE != "skip":
                     try:
-                        checksum = file_sha256(path)
+                        size1 = os.path.getsize(path)
+                        mtime1 = os.path.getmtime(path)
                     except OSError:
                         continue
 
-                if checksum is None:
-                    event_key = make_event_key_no_checksum(camera_code, f, size2, mtime2)
-                else:
-                    event_key = make_event_key(camera_code, f, size2, checksum)
-                if event_key in seen_keys:
-                    continue
+                    camera_code = detect_camera_code(f)
+                    name_key = (camera_code, f)
+                    if name_key in seen_names:
+                        continue
+                    if FILE_STABILIZE_SECONDS > 0:
+                        time.sleep(FILE_STABILIZE_SECONDS)
 
-                status = "quarantine" if too_old else "ready"
-                quarantine_reason = "too_old" if too_old else None
-
-                try:
-                    with conn:
-                        with conn.cursor() as cur:
-                            cur.execute(_INSERT_SQL, (
-                                path,
-                                site_code, site_code, site_code, site_code,
-                                camera_code, camera_code, camera_code,
-                                camera_code,
-                                event_key, f, path, size2, status, camera_code,
-                                checksum, quarantine_reason, ftp_written_at_utc, detected_at_utc,
-                                f, size2, checksum,
-                            ))
-
-                            # Dual-write to simplified schema (Phase A, non-critical)
-                            cur.execute(
-                                """
-                                INSERT INTO photo_sources (
-                                  source_key, tenant_code, site_code, camera_code,
-                                  ftp_root, ftp_subpath, file_prefix,
-                                  recipient_id, fallback_recipient_id, is_active
-                                )
-                                SELECT
-                                  'cam:' || c.id::text,
-                                  COALESCE(t.code, 'default'),
-                                  COALESCE(s.code, 'default'),
-                                  c.camera_code, '/source', '', c.file_prefix,
-                                  (SELECT cr1.recipient_id FROM camera_routes cr1
-                                   WHERE cr1.camera_id=c.id AND cr1.is_active=true
-                                   ORDER BY cr1.priority ASC, cr1.id ASC LIMIT 1),
-                                  COALESCE(s.default_recipient_id, t.default_recipient_id),
-                                  true
-                                FROM events e
-                                JOIN cameras c ON c.id=e.camera_id
-                                LEFT JOIN sites s ON s.id=c.site_id
-                                LEFT JOIN tenants t ON t.id=c.tenant_id
-                                WHERE e.event_key=%s AND e.camera_id IS NOT NULL
-                                ON CONFLICT (source_key) DO NOTHING
-                                """,
-                                (event_key,),
-                            )
-                            cur.execute(
-                                """
-                                INSERT INTO photo_events (
-                                  id, event_key, source_id, file_name, full_path,
-                                  file_size, checksum_sha256, status, attempt_count,
-                                  next_retry_at, last_attempt_at, quarantine_reason,
-                                  last_error, provider_message_ref, sent_at,
-                                  delivered_at, ftp_removed_at, ftp_written_at, first_seen_at, updated_at
-                                )
-                                SELECT
-                                  e.id, e.event_key, ps.id, e.file_name, e.full_path,
-                                  e.file_size, e.checksum_sha256, e.status,
-                                  COALESCE(e.attempt_count, 0), e.next_retry_at,
-                                  e.last_attempt_at, e.quarantine_reason, e.last_error,
-                                  e.provider_message_ref, e.sent_at,
-                                  NULL::timestamptz, NULL::timestamptz, e.ftp_written_at,
-                                  COALESCE(e.first_seen_at, now()), now()
-                                FROM events e
-                                JOIN photo_sources ps
-                                  ON ps.source_key='cam:'||e.camera_id::text
-                                WHERE e.event_key=%s
-                                ON CONFLICT (event_key) DO NOTHING
-                                """,
-                                (event_key,),
-                            )
-
-                    seen_keys.add(event_key)
-                    seen_names.add(name_key)
-                    print(
-                        f"event ok site={site_code} cam={camera_code} "
-                        f"status={status} key={event_key}",
-                        flush=True,
-                    )
-                    _journal.info(
-                        f"watcher\tDISCOVERED"
-                        f"\tcamera={camera_code}\tfile={f}"
-                        f"\tsite={site_code}\tpath={path}"
-                        f"\tstatus={status}\treason={quarantine_reason or '-'}"
-                        f"\tftp_file_mtime={ftp_written_at_utc.isoformat()}"
-                        f"\tfile_size={size2}"
-                        f"\tkey={event_key}"
-                    )
-
-                except Exception as db_err:
-                    print(f"db error {camera_code}: {db_err}", flush=True)
-                    _journal.error(
-                        f"watcher\tERROR"
-                        f"\tcamera={camera_code}\tfile={f}"
-                        f"\tkey={event_key or '?'}"
-                        f"\terror={str(db_err)[:300]}"
-                    )
                     try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    conn = None
-                    break
+                        size2 = os.path.getsize(path)
+                        mtime2 = os.path.getmtime(path)
+                    except OSError:
+                        continue
 
-        if WATCH_USE_MTIME_CURSOR:
-            scan_from_ts = max(0.0, loop_started_at - WATCH_MTIME_GUARD_SECONDS)
+                    if size1 != size2 or mtime1 != mtime2:
+                        continue
 
-        if WATCH_LOOP_SLEEP_SECONDS > 0:
-            time.sleep(WATCH_LOOP_SLEEP_SECONDS)
+                    if size2 < WATCH_MIN_FILE_SIZE_BYTES:
+                        continue
 
-    except Exception as e:
-        print(f"watcher error: {e}", flush=True)
-        _journal.error(f"watcher\tERROR\tcamera=?\tfile=?\terror={str(e)[:300]}")
-        conn = None
-        if WATCH_LOOP_SLEEP_SECONDS > 0:
-            time.sleep(WATCH_LOOP_SLEEP_SECONDS)
+                    ftp_written_at_utc = datetime.fromtimestamp(mtime2, tz=timezone.utc)
+                    too_old = (loop_started_at - mtime2) > MAX_FILE_AGE_SECONDS
+
+                    detected_at_utc = datetime.now(timezone.utc)
+
+                    site_code = extract_site_from_path(path)
+
+                    checksum = None
+                    if WATCH_CHECKSUM_MODE != "skip":
+                        try:
+                            checksum = file_sha256(path)
+                        except OSError:
+                            continue
+
+                    if checksum is None:
+                        event_key = make_event_key_no_checksum(camera_code, f, size2, mtime2)
+                    else:
+                        event_key = make_event_key(camera_code, f, size2, checksum)
+                    if event_key in seen_keys:
+                        continue
+
+                    status = "quarantine" if too_old else "ready"
+                    quarantine_reason = "too_old" if too_old else None
+
+                    try:
+                        with conn:
+                            with conn.cursor() as cur:
+                                cur.execute(_INSERT_SQL, (
+                                    path,
+                                    site_code, site_code, site_code, site_code,
+                                    camera_code, camera_code, camera_code,
+                                    camera_code,
+                                    event_key, f, path, size2, status, camera_code,
+                                    checksum, quarantine_reason, ftp_written_at_utc, detected_at_utc,
+                                    f, size2, checksum,
+                                ))
+
+                                cur.execute(
+                                    """
+                                    INSERT INTO photo_sources (
+                                      source_key, tenant_code, site_code, camera_code,
+                                      ftp_root, ftp_subpath, file_prefix,
+                                      recipient_id, fallback_recipient_id, is_active
+                                    )
+                                    SELECT
+                                      'cam:' || c.id::text,
+                                      COALESCE(t.code, 'default'),
+                                      COALESCE(s.code, 'default'),
+                                      c.camera_code, '/source', '', c.file_prefix,
+                                      (SELECT cr1.recipient_id FROM camera_routes cr1
+                                       WHERE cr1.camera_id=c.id AND cr1.is_active=true
+                                       ORDER BY cr1.priority ASC, cr1.id ASC LIMIT 1),
+                                      COALESCE(s.default_recipient_id, t.default_recipient_id),
+                                      true
+                                    FROM events e
+                                    JOIN cameras c ON c.id=e.camera_id
+                                    LEFT JOIN sites s ON s.id=c.site_id
+                                    LEFT JOIN tenants t ON t.id=c.tenant_id
+                                    WHERE e.event_key=%s AND e.camera_id IS NOT NULL
+                                    ON CONFLICT (source_key) DO NOTHING
+                                    """,
+                                    (event_key,),
+                                )
+                                cur.execute(
+                                    """
+                                    INSERT INTO photo_events (
+                                      id, event_key, source_id, file_name, full_path,
+                                      file_size, checksum_sha256, status, attempt_count,
+                                      next_retry_at, last_attempt_at, quarantine_reason,
+                                      last_error, provider_message_ref, sent_at,
+                                      delivered_at, ftp_removed_at, ftp_written_at, first_seen_at, updated_at
+                                    )
+                                    SELECT
+                                      e.id, e.event_key, ps.id, e.file_name, e.full_path,
+                                      e.file_size, e.checksum_sha256, e.status,
+                                      COALESCE(e.attempt_count, 0), e.next_retry_at,
+                                      e.last_attempt_at, e.quarantine_reason, e.last_error,
+                                      e.provider_message_ref, e.sent_at,
+                                      NULL::timestamptz, NULL::timestamptz, e.ftp_written_at,
+                                      COALESCE(e.first_seen_at, now()), now()
+                                    FROM events e
+                                    JOIN photo_sources ps
+                                      ON ps.source_key='cam:'||e.camera_id::text
+                                    WHERE e.event_key=%s
+                                    ON CONFLICT (event_key) DO NOTHING
+                                    """,
+                                    (event_key,),
+                                )
+
+                        seen_keys.add(event_key)
+                        seen_names.add(name_key)
+                        print(
+                            f"event ok site={site_code} cam={camera_code} "
+                            f"status={status} key={event_key}",
+                            flush=True,
+                        )
+                        _journal.info(
+                            f"watcher\tDISCOVERED"
+                            f"\tcamera={camera_code}\tfile={f}"
+                            f"\tsite={site_code}\tpath={path}"
+                            f"\tstatus={status}\treason={quarantine_reason or '-'}"
+                            f"\tftp_file_mtime={ftp_written_at_utc.isoformat()}"
+                            f"\tfile_size={size2}"
+                            f"\tkey={event_key}"
+                        )
+
+                    except Exception as db_err:
+                        print(f"db error {camera_code}: {db_err}", flush=True)
+                        _journal.error(
+                            f"watcher\tERROR"
+                            f"\tcamera={camera_code}\tfile={f}"
+                            f"\tkey={event_key or '?'}"
+                            f"\terror={str(db_err)[:300]}"
+                        )
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        conn = None
+                        break
+
+            if WATCH_USE_MTIME_CURSOR:
+                scan_from_ts = max(0.0, loop_started_at - WATCH_MTIME_GUARD_SECONDS)
+
+            loops_done += 1
+            if max_loops is not None and loops_done >= int(max_loops):
+                return
+
+            if WATCH_LOOP_SLEEP_SECONDS > 0:
+                time.sleep(WATCH_LOOP_SLEEP_SECONDS)
+
+        except Exception as e:
+            print(f"watcher error: {e}", flush=True)
+            _journal.error(f"watcher\tERROR\tcamera=?\tfile=?\terror={str(e)[:300]}")
+            conn = None
+            if WATCH_LOOP_SLEEP_SECONDS > 0:
+                time.sleep(WATCH_LOOP_SLEEP_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
 
