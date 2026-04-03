@@ -16,3 +16,22 @@ n8n/
 # IDE
 .idea/
 .vscode/
+
+# Cascade/Windsurf local artifacts
+.windsurf/
+CascadeProjects/
+
+# Local bundles / archives
+*.7z
+
+# Local scratch files
+cursor config.txt
+camera-system-v2/.commit*-msg.txt
+camera-system-v2/PR_DESCRIPTION.md
+
+# Local remediation/status artifacts (not tracked)
+Final_remediation_plan.md
+Master_remediation_plan.md
+Master_remediation_plan_clean.md
+SERVER_STATUS_*.md
+architecture-review-remediation-*.md
