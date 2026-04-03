@@ -1,0 +1,40 @@
+[run]
+# Coverage configuration
+source = app
+branch = True
+parallel = False
+dynamic_context = test_function
+
+[report]
+# Coverage report settings
+precision = 1
+show_missing = True
+skip_covered = False
+skip_empty = True
+
+# Files to exclude from coverage
+omit =
+    */tests/*
+    */test_*.py
+    */__pycache__/*
+    app/__pycache__/*
+    */venv/*
+    */virtualenv/*
+    .venv/*
+
+# Coverage thresholds (fail if below)
+fail_under = 0
+
+[html]
+# HTML report settings
+directory = reports/unit/htmlcov
+title = Camera System V2 - Unit Test Coverage
+
+[xml]
+# XML report output
+output = reports/unit/coverage.xml
+
+[json]
+# JSON report output
+output = reports/unit/coverage.json
+pretty_print = True

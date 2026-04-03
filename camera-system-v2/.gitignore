@@ -14,3 +14,21 @@ logs/
 # IDE
 .idea/
 .vscode/
+
+# Testing artifacts
+reports/
+htmlcov/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Test logs
+unittest_results.txt
+test_run.log
+test_*.txt
+run_tests_helper.py
+run_all_tests.py
